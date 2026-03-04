@@ -133,12 +133,17 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 		return errors.New("homekit: AddTrack only for sendonly (backchannel)")
 	}
 
-	// Save the backchannel track info for deferred start. The SRTP audio
-	// session doesn't exist yet — it's created in Start(). The actual
-	// ffmpeg pipeline and sender handler are wired up in startBackchannel()
-	// which is called from Start() after the SRTP session is established.
 	c.backchannelCodec = codec
 	c.backchannelTrack = track
+
+	// If Start() already ran (audioSession exists), start backchannel immediately.
+	// This handles the case where a mic consumer (e.g. WebRTC) connects after
+	// a non-mic consumer (e.g. MSE) already triggered Start().
+	if c.audioSession != nil {
+		if err := c.startBackchannel(); err != nil {
+			return fmt.Errorf("homekit: late backchannel start: %w", err)
+		}
+	}
 
 	return nil
 }
