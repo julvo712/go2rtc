@@ -166,14 +166,18 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 // readAndSend reads AAC-ELD RTP packets from ffmpeg's output UDP port
 // and forwards them to the HomeKit camera via SRTP.
 //
-// ffmpeg outputs AAC in standard RFC 3640 RTP format, which is what
-// HomeKit cameras expect for AAC-ELD. We forward the payload as-is
-// through session.WriteRTP which handles SRTP encryption, SSRC, and
-// PayloadType injection.
+// ffmpeg's native AAC encoder with ELD profile produces 1024-sample frames
+// packed multiple per RTP packet (RFC 3640 with AU headers). HomeKit cameras
+// expect single AAC-ELD frames per RTP packet with 480-sample timestamps.
+// We unpack the multi-frame packets and send each frame individually with
+// corrected timestamps.
 func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *int) {
 	buf := make([]byte, 2048)
 
-	var debugCount int
+	// HomeKit expects 480-sample timestamp increments (30ms at 16kHz)
+	const timestampIncrement = 480
+	var timestamp uint32
+	var seq uint16
 
 	for {
 		n, _, err := p.udpConn.ReadFrom(buf)
@@ -193,19 +197,59 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 			continue
 		}
 
-		// Debug: log first few packets to verify format
-		if debugCount < 5 {
-			fmt.Printf("[backchannel] ffmpeg RTP: PT=%d SSRC=%08x TS=%d Seq=%d PayloadLen=%d Payload[:8]=%x\n",
-				packet.PayloadType, packet.SSRC, packet.Timestamp, packet.SequenceNumber,
-				len(packet.Payload), packet.Payload[:min(8, len(packet.Payload))])
-			fmt.Printf("[backchannel] session: PT=%d LocalSSRC=%08x RemoteAddr=%s\n",
-				session.PayloadType, session.Local.SSRC, session.Remote.Addr+":"+fmt.Sprint(session.Remote.Port))
-			debugCount++
+		// Unpack RFC 3640 AU headers and send each AAC frame individually
+		payload := packet.Payload
+		if len(payload) < 4 {
+			continue
 		}
 
-		// Forward to camera via SRTP
-		if sent, err := session.WriteRTP(packet); err == nil {
-			*sendCounter += sent
+		// First 2 bytes: AU-headers-length in bits
+		auHeadersLenBits := int(payload[0])<<8 | int(payload[1])
+		auHeadersLen := (auHeadersLenBits + 7) / 8 // round up to bytes
+		numFrames := auHeadersLen / 2               // each AU header is 16 bits (13 size + 3 index)
+
+		if numFrames == 0 || len(payload) < 2+auHeadersLen {
+			continue
+		}
+
+		// Parse AU sizes from headers
+		headers := payload[2 : 2+auHeadersLen]
+		data := payload[2+auHeadersLen:]
+
+		for i := 0; i < numFrames && len(headers) >= 2; i++ {
+			auSize := (int(headers[0])<<8 | int(headers[1])) >> 3 // 13-bit size
+			headers = headers[2:]
+
+			if auSize > len(data) {
+				break
+			}
+
+			frame := data[:auSize]
+			data = data[auSize:]
+
+			// Wrap single frame in RFC 3640 format (single AU)
+			singlePayload := make([]byte, 4+len(frame))
+			singlePayload[0] = 0x00
+			singlePayload[1] = 0x10                                           // 16 bits of AU headers
+			singlePayload[2] = byte((len(frame) << 3) >> 8)                   // AU size high bits
+			singlePayload[3] = byte((len(frame) << 3) & 0xFF)                 // AU size low bits
+			copy(singlePayload[4:], frame)
+
+			singlePacket := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					Marker:         true,
+					SequenceNumber: seq,
+					Timestamp:      timestamp,
+				},
+				Payload: singlePayload,
+			}
+			seq++
+			timestamp += timestampIncrement
+
+			if sent, err := session.WriteRTP(singlePacket); err == nil {
+				*sendCounter += sent
+			}
 		}
 	}
 }
