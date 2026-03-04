@@ -160,9 +160,53 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 	return nil
 }
 
+// unmuteSpeaker sets the Speaker service's Mute characteristic to false.
+// HomeKit cameras may default to muted; without this the camera ignores
+// incoming audio even though SRTP packets are delivered correctly.
+func (c *Client) unmuteSpeaker() {
+	acc, err := c.hap.GetFirstAccessory()
+	if err != nil {
+		log.Printf("[homekit] unmute: failed to get accessory: %v", err)
+		return
+	}
+
+	speaker := acc.GetService("113") // TypeSpeaker
+	if speaker == nil {
+		log.Printf("[homekit] unmute: no speaker service")
+		return
+	}
+
+	muteChar := speaker.GetCharacter("11A") // Mute
+	if muteChar == nil {
+		log.Printf("[homekit] unmute: no mute characteristic")
+		return
+	}
+
+	muteChar.Value = false
+	if err := c.hap.PutCharacters(muteChar); err != nil {
+		log.Printf("[homekit] unmute: failed to set mute=false: %v", err)
+		return
+	}
+	log.Printf("[homekit] unmuted speaker (IID=%d)", muteChar.IID)
+
+	// Also try setting volume if available
+	volChar := speaker.GetCharacter("119") // Volume
+	if volChar != nil {
+		volChar.Value = 100
+		if err := c.hap.PutCharacters(volChar); err != nil {
+			log.Printf("[homekit] volume: failed to set: %v", err)
+		} else {
+			log.Printf("[homekit] set speaker volume to 100 (IID=%d)", volChar.IID)
+		}
+	}
+}
+
 // startBackchannel wires up the backchannel audio pipeline after the SRTP
 // session has been established. Must be called from Start().
 func (c *Client) startBackchannel() error {
+	// Unmute the camera speaker before starting backchannel audio
+	c.unmuteSpeaker()
+
 	codec := c.backchannelCodec
 	track := c.backchannelTrack
 
