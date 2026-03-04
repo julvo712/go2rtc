@@ -173,6 +173,8 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *int) {
 	buf := make([]byte, 2048)
 
+	var debugCount int
+
 	for {
 		n, _, err := p.udpConn.ReadFrom(buf)
 		if err != nil {
@@ -189,6 +191,16 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 		packet := &rtp.Packet{}
 		if err := packet.Unmarshal(buf[:n]); err != nil {
 			continue
+		}
+
+		// Debug: log first few packets to verify format
+		if debugCount < 5 {
+			fmt.Printf("[backchannel] ffmpeg RTP: PT=%d SSRC=%08x TS=%d Seq=%d PayloadLen=%d Payload[:8]=%x\n",
+				packet.PayloadType, packet.SSRC, packet.Timestamp, packet.SequenceNumber,
+				len(packet.Payload), packet.Payload[:min(8, len(packet.Payload))])
+			fmt.Printf("[backchannel] session: PT=%d LocalSSRC=%08x RemoteAddr=%s\n",
+				session.PayloadType, session.Local.SSRC, session.Remote.Addr+":"+fmt.Sprint(session.Remote.Port))
+			debugCount++
 		}
 
 		// Forward to camera via SRTP
