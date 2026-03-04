@@ -2,24 +2,32 @@ package homekit
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"sync"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/AlexxIT/go2rtc/pkg/shell"
 	"github.com/AlexxIT/go2rtc/pkg/srtp"
 	"github.com/pion/rtp"
 )
 
-// backchannelPipeline manages the ffmpeg transcoding subprocess that converts
+// backchannelPipeline manages the ffmpeg transcoding subprocess(es) that convert
 // incoming Opus RTP packets (from WebRTC) to AAC-ELD RTP packets, which are
 // then sent to the HomeKit camera via SRTP.
+//
+// Two modes:
+//   - Two-process (libfdk_aac): encoder outputs LATM to pipe, muxer remuxes to RTP.
+//     This bypasses libfdk_aac's inability to encode ELD with RAW transport
+//     (which -f rtp requires via GLOBAL_HEADER).
+//   - Single-process (native AAC): encoder outputs RTP directly.
+//     Produces 1024-sample frames (vs 480 expected), split in readAndSend.
 type backchannelPipeline struct {
-	cmd      *shell.Command
+	cmds     []*exec.Cmd
+	cancel   context.CancelFunc
 	sendConn *net.UDPConn   // sends Opus RTP to ffmpeg input
 	udpConn  net.PacketConn // receives AAC-ELD RTP from ffmpeg output
 	sdpFile  string         // temp SDP file path
@@ -27,13 +35,34 @@ type backchannelPipeline struct {
 	closed   bool
 }
 
-// startBackchannelPipeline spawns an ffmpeg process that:
-// 1. Receives Opus RTP on a localhost UDP port
-// 2. Transcodes Opus → AAC-ELD (16kHz mono)
-// 3. Outputs AAC-ELD RTP to another localhost UDP port
+// findELDEncoder searches for an ffmpeg binary that can encode AAC-ELD
+// using libfdk_aac with LATM output (which supports ELD, unlike -f rtp).
+func findELDEncoder() string {
+	for _, bin := range []string{
+		"/usr/local/bin/ffmpeg-homebridge",
+		"/usr/local/bin/ffmpeg-fdk",
+		"ffmpeg-fdk",
+		"ffmpeg",
+	} {
+		testCmd := exec.Command(bin,
+			"-hide_banner", "-loglevel", "error",
+			"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+			"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-latm", "1",
+			"-ar", "16000", "-ac", "1",
+			"-f", "latm", os.DevNull)
+		if err := testCmd.Run(); err == nil {
+			return bin
+		}
+	}
+	return ""
+}
+
+// startBackchannelPipeline spawns ffmpeg process(es) that:
+// 1. Receive Opus RTP on a localhost UDP port
+// 2. Transcode Opus → AAC-ELD (16kHz mono)
+// 3. Output AAC-ELD RTP to another localhost UDP port
 //
 // It returns the pipeline and a handler function for incoming Opus RTP packets.
-// A goroutine reads AAC-ELD RTP output and sends it to the camera via SRTP.
 func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backchannelPipeline, core.HandlerFunc, error) {
 	// Open a UDP port for ffmpeg to listen on for Opus RTP input.
 	// We bind it, get the port, then close — ffmpeg will bind it when it starts.
@@ -81,76 +110,32 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	}
 	sdpFile.Close()
 
-	// Spawn ffmpeg to transcode Opus RTP → AAC-ELD RTP
-	// Prefer an ffmpeg with libfdk_aac that can actually encode AAC-ELD.
-	// The system libfdk-aac package may not support ELD with RAW transport,
-	// so we test actual encoding rather than just checking -encoders.
-	// Recommended: install homebridge static ffmpeg which bundles working libfdk-aac:
-	//   curl -Lf https://github.com/homebridge/ffmpeg-for-homebridge/releases/latest/download/ffmpeg-alpine-x86_64.tar.gz | tar xzf - -C /tmp && cp /tmp/usr/local/bin/ffmpeg /usr/local/bin/ffmpeg-homebridge
-	ffmpegBin := ""
-	ffmpegCodec := ""
-	for _, bin := range []string{"/usr/local/bin/ffmpeg-homebridge", "/usr/local/bin/ffmpeg-fdk", "ffmpeg-fdk", "ffmpeg"} {
-		// Actually test AAC-ELD encoding — some libfdk-aac versions fail at init
-		testCmd := shell.NewCommand(bin + " -hide_banner -loglevel error -f lavfi -i sine=frequency=440:duration=0.1 -c:a libfdk_aac -profile:a aac_eld -ar 16000 -ac 1 -f null /dev/null")
-		if err := testCmd.Run(); err == nil {
-			ffmpegBin = bin
-			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld"
-			log.Printf("[backchannel] using %s with libfdk_aac (ELD test passed)", bin)
-			break
-		}
-	}
-	if ffmpegBin == "" {
-		// Fall back to native AAC encoder (produces 1024-sample frames,
-		// split into individual frames in readAndSend)
-		ffmpegBin = "ffmpeg"
-		ffmpegCodec = "-c:a aac -profile:a aac_eld"
-		log.Printf("[backchannel] WARNING: no ffmpeg with working libfdk_aac ELD found, using native encoder")
-	}
-
-	ffmpegCmd := fmt.Sprintf(
-		"%s -hide_banner -loglevel error"+
-			" -protocol_whitelist file,rtp,udp"+
-			" -f sdp -i %s"+
-			" %s -ar 16000 -ac 1 -b:a 32k"+
-			" -f rtp rtp://127.0.0.1:%d",
-		ffmpegBin, sdpFileName, ffmpegCodec, outputPort,
-	)
-
-	log.Printf("[backchannel] ffmpeg cmd: %s", ffmpegCmd)
-	log.Printf("[backchannel] SDP content:\n%s", sdp)
-
-	cmd := shell.NewCommand(ffmpegCmd)
-
-	// Capture stderr for debugging
-	stderr, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
-		outputConn.Close()
-		os.Remove(sdpFileName)
-		return nil, nil, fmt.Errorf("backchannel: start ffmpeg: %w", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	pipeline := &backchannelPipeline{
-		cmd:     cmd,
 		udpConn: outputConn,
 		sdpFile: sdpFileName,
+		cancel:  cancel,
 	}
 
-	// Log ffmpeg stderr in background
-	if stderr != nil {
-		go func() {
-			scanner := bufio.NewScanner(stderr)
-			for scanner.Scan() {
-				log.Printf("[backchannel] ffmpeg stderr: %s", scanner.Text())
-			}
-		}()
+	// Try two-process mode with libfdk_aac (proper 480-sample AAC-ELD frames)
+	eldEncoder := findELDEncoder()
+	if eldEncoder != "" {
+		err = pipeline.startTwoProcess(ctx, eldEncoder, sdpFileName, outputPort)
+		if err != nil {
+			log.Printf("[backchannel] two-process start failed: %v, falling back to native", err)
+			eldEncoder = "" // fall through to single-process
+		}
 	}
 
-	// Log when ffmpeg exits
-	go func() {
-		<-cmd.Done()
-		log.Printf("[backchannel] ffmpeg process exited")
-	}()
+	// Fall back to single-process with native AAC encoder
+	if eldEncoder == "" {
+		err = pipeline.startSingleProcess(ctx, sdpFileName, outputPort)
+		if err != nil {
+			pipeline.Close()
+			return nil, nil, fmt.Errorf("backchannel: start ffmpeg: %w", err)
+		}
+	}
 
 	// Start goroutine to read AAC-ELD RTP from ffmpeg output and send to camera
 	go pipeline.readAndSend(session, sendCounter)
@@ -167,8 +152,6 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	var seq uint16
 	var handlerCount int
 	handler := func(packet *rtp.Packet) {
-		// Re-create a clean RTP packet with the correct payload type
-		// matching our SDP (PT 111 = Opus)
 		clone := rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
@@ -184,7 +167,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		handlerCount++
 
 		if handlerCount <= 3 {
-			log.Printf("[backchannel] handler sending Opus packet #%d to ffmpeg: payloadLen=%d ts=%d",
+			log.Printf("[backchannel] handler sending Opus packet #%d: payloadLen=%d ts=%d",
 				handlerCount, len(packet.Payload), packet.Timestamp)
 		}
 
@@ -192,33 +175,142 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		if err != nil {
 			return
 		}
-
-		if _, err := sendConn.Write(b); err != nil && handlerCount <= 3 {
-			log.Printf("[backchannel] handler Write error: %v", err)
-		}
+		sendConn.Write(b)
 	}
 
-	// Clean up send socket when ffmpeg exits
+	// Clean up send socket when pipeline context is cancelled
 	go func() {
-		<-cmd.Done()
+		<-ctx.Done()
 		sendConn.Close()
 	}()
 
 	return pipeline, handler, nil
 }
 
+// startTwoProcess launches a two-process pipeline:
+//
+//	encoder (libfdk_aac → LATM stdout) | muxer (LATM stdin → RTP UDP)
+//
+// This works around libfdk_aac's inability to encode AAC-ELD when the output
+// format sets GLOBAL_HEADER (which selects RAW transport — unsupported for ELD).
+// LATM output uses LOAS transport which supports ELD.
+func (p *backchannelPipeline) startTwoProcess(ctx context.Context, encoderBin, sdpFile string, outputPort int) error {
+	log.Printf("[backchannel] using two-process mode: %s (libfdk_aac → LATM) | ffmpeg (LATM → RTP)", encoderBin)
+
+	// Process 1: Opus RTP → AAC-ELD LATM (stdout)
+	encoder := exec.CommandContext(ctx, encoderBin,
+		"-hide_banner", "-loglevel", "error",
+		"-protocol_whitelist", "file,rtp,udp",
+		"-f", "sdp", "-i", sdpFile,
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-latm", "1",
+		"-ar", "16000", "-ac", "1", "-b:a", "32k",
+		"-f", "latm", "pipe:1")
+
+	// Process 2: LATM (stdin) → RTP UDP
+	muxer := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "latm", "-i", "pipe:0",
+		"-c:a", "copy",
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
+
+	// Connect encoder stdout → muxer stdin via OS pipe
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("os.Pipe: %w", err)
+	}
+	encoder.Stdout = pw
+	muxer.Stdin = pr
+
+	// Capture stderr from both processes
+	encoderStderr, _ := encoder.StderrPipe()
+	muxerStderr, _ := muxer.StderrPipe()
+
+	if err := encoder.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return fmt.Errorf("start encoder: %w", err)
+	}
+	if err := muxer.Start(); err != nil {
+		encoder.Process.Kill()
+		pr.Close()
+		pw.Close()
+		return fmt.Errorf("start muxer: %w", err)
+	}
+
+	// Close parent's pipe ends — children have inherited their own fds
+	pw.Close()
+	pr.Close()
+
+	p.cmds = []*exec.Cmd{encoder, muxer}
+
+	// Drain stderr from both processes
+	go drainStderr("encoder", encoderStderr)
+	go drainStderr("muxer", muxerStderr)
+
+	// Log when processes exit
+	go func() {
+		encoder.Wait()
+		log.Printf("[backchannel] encoder process exited")
+	}()
+	go func() {
+		muxer.Wait()
+		log.Printf("[backchannel] muxer process exited")
+	}()
+
+	return nil
+}
+
+// startSingleProcess launches a single ffmpeg with native AAC encoder.
+// Produces 1024-sample frames (split in readAndSend).
+func (p *backchannelPipeline) startSingleProcess(ctx context.Context, sdpFile string, outputPort int) error {
+	log.Printf("[backchannel] WARNING: using single-process mode with native AAC encoder (1024-sample frames)")
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-protocol_whitelist", "file,rtp,udp",
+		"-f", "sdp", "-i", sdpFile,
+		"-c:a", "aac", "-profile:a", "aac_eld",
+		"-ar", "16000", "-ac", "1", "-b:a", "32k",
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
+
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	p.cmds = []*exec.Cmd{cmd}
+
+	go drainStderr("ffmpeg", stderr)
+	go func() {
+		cmd.Wait()
+		log.Printf("[backchannel] ffmpeg process exited")
+	}()
+
+	return nil
+}
+
+func drainStderr(name string, stderr interface{ Read([]byte) (int, error) }) {
+	if stderr == nil {
+		return
+	}
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		log.Printf("[backchannel] %s stderr: %s", name, scanner.Text())
+	}
+}
+
 // readAndSend reads AAC-ELD RTP packets from ffmpeg's output UDP port
 // and forwards them to the HomeKit camera via SRTP.
 //
-// ffmpeg's native AAC encoder with ELD profile produces 1024-sample frames
-// packed multiple per RTP packet (RFC 3640 with AU headers). HomeKit cameras
-// expect single AAC-ELD frames per RTP packet with 480-sample timestamps.
-// We unpack the multi-frame packets and send each frame individually with
-// corrected timestamps.
+// Both pipeline modes output RFC 3640 RTP packets. The native encoder
+// packs multiple 1024-sample frames per packet; the libfdk_aac/LATM
+// pipeline produces single 480-sample frames per packet.
+// We unpack AU headers and send each frame individually with 480-sample
+// timestamp increments (30ms at 16kHz), as HomeKit cameras expect.
 func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *int) {
 	buf := make([]byte, 2048)
 
-	// HomeKit expects 480-sample timestamp increments (30ms at 16kHz)
 	const timestampIncrement = 480
 	var timestamp uint32
 	var seq uint16
@@ -233,69 +325,63 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 			closed := p.closed
 			p.mu.Unlock()
 			if !closed {
-				log.Printf("[backchannel] readAndSend unexpected error: %v", err)
+				log.Printf("[backchannel] readAndSend error: %v", err)
 			}
 			log.Printf("[backchannel] readAndSend exiting, totalRead=%d", totalRead)
 			return
 		}
 
 		totalRead++
-		if totalRead <= 3 {
-			log.Printf("[backchannel] readAndSend got packet #%d: %d bytes", totalRead, n)
+		if totalRead <= 5 {
+			log.Printf("[backchannel] readAndSend packet #%d: %d bytes", totalRead, n)
 		}
 
 		// Parse the RTP packet from ffmpeg
 		packet := &rtp.Packet{}
 		if err := packet.Unmarshal(buf[:n]); err != nil {
-			log.Printf("[backchannel] readAndSend unmarshal error: %v", err)
+			log.Printf("[backchannel] unmarshal error: %v", err)
 			continue
 		}
 
 		// Unpack RFC 3640 AU headers and send each AAC frame individually
 		payload := packet.Payload
 		if len(payload) < 4 {
-			if totalRead <= 3 {
-				log.Printf("[backchannel] readAndSend payload too short: %d", len(payload))
-			}
 			continue
 		}
 
-		// First 2 bytes: AU-headers-length in bits
 		auHeadersLenBits := int(payload[0])<<8 | int(payload[1])
-		auHeadersLen := (auHeadersLenBits + 7) / 8 // round up to bytes
-		numFrames := auHeadersLen / 2               // each AU header is 16 bits (13 size + 3 index)
+		auHeadersLen := (auHeadersLenBits + 7) / 8
+		numFrames := auHeadersLen / 2
 
 		if numFrames == 0 || len(payload) < 2+auHeadersLen {
 			continue
 		}
 
-		// Parse AU sizes from headers
 		headers := payload[2 : 2+auHeadersLen]
 		data := payload[2+auHeadersLen:]
 
-		if totalRead <= 3 {
-			log.Printf("[backchannel] readAndSend PT=%d numFrames=%d auHeadersLen=%d dataLen=%d",
-				packet.PayloadType, numFrames, auHeadersLen, len(data))
+		if totalRead <= 5 {
+			log.Printf("[backchannel] PT=%d frames=%d dataLen=%d ts=%d",
+				packet.PayloadType, numFrames, len(data), packet.Timestamp)
 		}
 
 		for i := 0; i < numFrames && len(headers) >= 2; i++ {
-			auSize := (int(headers[0])<<8 | int(headers[1])) >> 3 // 13-bit size
+			auSize := (int(headers[0])<<8 | int(headers[1])) >> 3
 			headers = headers[2:]
 
-			if auSize > len(data) {
-				log.Printf("[backchannel] readAndSend auSize %d > dataLen %d", auSize, len(data))
+			if auSize <= 0 || auSize > len(data) {
 				break
 			}
 
 			frame := data[:auSize]
 			data = data[auSize:]
 
-			// Wrap single frame in RFC 3640 format (single AU)
+			// Wrap single frame in RFC 3640 format
 			singlePayload := make([]byte, 4+len(frame))
 			singlePayload[0] = 0x00
-			singlePayload[1] = 0x10                                           // 16 bits of AU headers
-			singlePayload[2] = byte((len(frame) << 3) >> 8)                   // AU size high bits
-			singlePayload[3] = byte((len(frame) << 3) & 0xFF)                 // AU size low bits
+			singlePayload[1] = 0x10
+			singlePayload[2] = byte((len(frame) << 3) >> 8)
+			singlePayload[3] = byte((len(frame) << 3) & 0xFF)
 			copy(singlePayload[4:], frame)
 
 			singlePacket := &rtp.Packet{
@@ -312,14 +398,14 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 
 			if sent, err := session.WriteRTP(singlePacket); err == nil {
 				*sendCounter += sent
-			} else if totalRead <= 3 {
-				log.Printf("[backchannel] readAndSend WriteRTP error: %v", err)
+			} else if totalRead <= 5 {
+				log.Printf("[backchannel] WriteRTP error: %v", err)
 			}
 		}
 	}
 }
 
-// Close shuts down the ffmpeg process and cleans up resources.
+// Close shuts down ffmpeg process(es) and cleans up resources.
 func (p *backchannelPipeline) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -329,45 +415,22 @@ func (p *backchannelPipeline) Close() error {
 	}
 	p.closed = true
 
+	if p.cancel != nil {
+		p.cancel()
+	}
 	if p.sendConn != nil {
 		p.sendConn.Close()
 	}
 	if p.udpConn != nil {
 		p.udpConn.Close()
 	}
-	if p.cmd != nil {
-		p.cmd.Close()
+	for _, cmd := range p.cmds {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
 	}
 	if p.sdpFile != "" {
 		os.Remove(p.sdpFile)
 	}
 	return nil
-}
-
-// readADTSFrame reads a single ADTS frame from a reader.
-// Currently unused but kept for potential pipe-based approach.
-func readADTSFrame(r *bufio.Reader) ([]byte, error) {
-	header := make([]byte, 7) // ADTS header is 7 bytes
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
-	}
-
-	// Verify sync word
-	if header[0] != 0xFF || header[1]&0xF0 != 0xF0 {
-		return nil, fmt.Errorf("backchannel: not ADTS sync: %x%x", header[0], header[1])
-	}
-
-	// Extract frame size from ADTS header bits
-	frameSize := int(header[3]&0x03)<<11 | int(header[4])<<3 | int(header[5]>>5)
-	if frameSize < 7 {
-		return nil, fmt.Errorf("backchannel: invalid ADTS frame size: %d", frameSize)
-	}
-
-	// Read the remaining payload (frameSize includes the 7-byte header)
-	payload := make([]byte, frameSize-7)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-
-	return payload, nil
 }
