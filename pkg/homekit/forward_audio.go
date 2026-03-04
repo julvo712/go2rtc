@@ -2,7 +2,6 @@ package homekit
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -45,9 +44,12 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	}
 	opusPort := opusListener.LocalAddr().(*net.UDPAddr).Port
 
-	// AudioSpecificConfig for AAC-ELD 16kHz mono, 480-sample frames, no SBR
-	conf := aac.EncodeConfig(aac.TypeAACELD, 16000, 1, true)
-	configHex := hex.EncodeToString(conf)
+	// AudioSpecificConfig for AAC-ELD 16kHz mono.
+	// Use the homebridge-proven config which includes SBR parameters,
+	// matching what HomeKit cameras actually send.
+	// Fallback configs to try if this fails: "f8ec3000" (24kHz no-SBR),
+	// "f8f03000" (16kHz no-SBR).
+	configHex := "F8F0212C00BC00"
 
 	sdp := fmt.Sprintf(
 		"v=0\r\n"+
