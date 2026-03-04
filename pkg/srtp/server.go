@@ -91,9 +91,14 @@ func (s *Server) handle() error {
 			ssrc := binary.BigEndian.Uint32(b[8:])
 			if session := s.GetSession(ssrc); session != nil {
 				readCount++
-				if readCount <= 3 {
-					log.Printf("[srtp] ReadRTP #%d: PT=%d SSRC=%d from=%s remoteAddr=%s len=%d",
-						readCount, packetType, ssrc, addr, session.Remote.addr, n)
+				if readCount <= 5 {
+					pt := packetType & 0x7F
+					kind := "video"
+					if pt == 110 {
+						kind = "audio"
+					}
+					log.Printf("[srtp] ReadRTP #%d %s: PT=%d SSRC=%d from=%s remoteAddr=%s len=%d",
+						readCount, kind, pt, ssrc, addr, session.Remote.addr, n)
 				}
 				session.ReadRTP(b[:n])
 			}

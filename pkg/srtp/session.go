@@ -1,8 +1,10 @@
 package srtp
 
 import (
+	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -27,6 +29,7 @@ type Session struct {
 	senderRTCP rtcp.SenderReport
 	senderTime time.Time
 	writeCount int
+	writeMu    sync.Mutex
 }
 
 type Endpoint struct {
@@ -71,6 +74,9 @@ func (s *Session) init() error {
 }
 
 func (s *Session) WriteRTP(packet *rtp.Packet) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	if s.Local.srtp == nil {
 		return 0, nil // before init call
 	}
@@ -78,7 +84,7 @@ func (s *Session) WriteRTP(packet *rtp.Packet) (int, error) {
 	if now := time.Now(); now.After(s.senderTime) {
 		s.senderRTCP.NTPTime = uint64(now.UnixNano())
 		s.senderTime = now.Add(s.RTCPInterval)
-		_, _ = s.WriteRTCP(&s.senderRTCP)
+		_, _ = s.writeRTCP(&s.senderRTCP)
 	}
 
 	clone := rtp.Packet{
@@ -108,15 +114,20 @@ func (s *Session) WriteRTP(packet *rtp.Packet) (int, error) {
 
 	n, err := s.conn.WriteTo(b, s.Remote.addr)
 	s.writeCount++
-	if s.writeCount <= 3 {
-		log.Printf("[srtp] WriteRTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d → dest=%s encLen=%d written=%d err=%v from=%s",
+	if s.writeCount <= 5 {
+		hexDump := fmt.Sprintf("%x", clone.Payload)
+		if len(hexDump) > 80 {
+			hexDump = hexDump[:80] + "..."
+		}
+		log.Printf("[srtp] WriteRTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d → dest=%s written=%d err=%v hex=%s",
 			s.writeCount, clone.PayloadType, clone.SSRC, clone.SequenceNumber, clone.Timestamp,
-			len(clone.Payload), s.Remote.addr, len(b), n, err, s.conn.LocalAddr())
+			len(clone.Payload), s.Remote.addr, n, err, hexDump)
 	}
 	return n, err
 }
 
-func (s *Session) WriteRTCP(packet rtcp.Packet) (int, error) {
+// writeRTCP sends RTCP — caller must hold writeMu.
+func (s *Session) writeRTCP(packet rtcp.Packet) (int, error) {
 	b, err := packet.Marshal()
 	if err != nil {
 		return 0, err
@@ -126,6 +137,12 @@ func (s *Session) WriteRTCP(packet rtcp.Packet) (int, error) {
 		return 0, err
 	}
 	return s.conn.WriteTo(b, s.Remote.addr)
+}
+
+func (s *Session) WriteRTCP(packet rtcp.Packet) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.writeRTCP(packet)
 }
 
 func (s *Session) ReadRTP(b []byte) {
