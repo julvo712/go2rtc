@@ -75,7 +75,7 @@ func (s *Server) GetSession(ssrc uint32) (session *Session) {
 
 func (s *Server) handle() error {
 	b := make([]byte, 2048)
-	var readCount int
+	var videoReadCount, audioReadCount int
 	for {
 		n, addr, err := s.conn.ReadFrom(b)
 		if err != nil {
@@ -90,15 +90,19 @@ func (s *Server) handle() error {
 			// this is default position for SSRC in RTP packet
 			ssrc := binary.BigEndian.Uint32(b[8:])
 			if session := s.GetSession(ssrc); session != nil {
-				readCount++
-				if readCount <= 5 {
-					pt := packetType & 0x7F
-					kind := "video"
-					if pt == 110 {
-						kind = "audio"
+				pt := packetType & 0x7F
+				if pt == 110 {
+					audioReadCount++
+					if audioReadCount <= 3 {
+						log.Printf("[srtp] ReadRTP audio #%d: SSRC=%d from=%s remoteAddr=%s len=%d",
+							audioReadCount, ssrc, addr, session.Remote.addr, n)
 					}
-					log.Printf("[srtp] ReadRTP #%d %s: PT=%d SSRC=%d from=%s remoteAddr=%s len=%d",
-						readCount, kind, pt, ssrc, addr, session.Remote.addr, n)
+				} else {
+					videoReadCount++
+					if videoReadCount <= 3 {
+						log.Printf("[srtp] ReadRTP video #%d: SSRC=%d from=%s remoteAddr=%s len=%d",
+							videoReadCount, ssrc, addr, session.Remote.addr, n)
+					}
 				}
 				session.ReadRTP(b[:n])
 			}

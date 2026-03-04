@@ -333,32 +333,6 @@ func (c *Client) Start() error {
 		}
 	}
 
-	// DIAGNOSTIC: Audio loopback — echo camera's own audio back to test
-	// the SRTP return path independently of the transcoding pipeline.
-	// If you hear the camera echoing itself, SRTP backchannel works.
-	if c.audioSession != nil {
-		origHandler := c.audioSession.OnReadRTP
-		var loopbackCount int
-		c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
-			if origHandler != nil {
-				origHandler(packet)
-			}
-			// Echo the camera's audio back to it
-			loopbackCount++
-			if loopbackCount <= 5 {
-				log.Printf("[homekit] LOOPBACK: echoing camera audio packet #%d: PT=%d payloadLen=%d ts=%d",
-					loopbackCount, packet.PayloadType, len(packet.Payload), packet.Timestamp)
-			}
-			if n, err := c.audioSession.WriteRTP(packet); err != nil {
-				if loopbackCount <= 5 {
-					log.Printf("[homekit] LOOPBACK: WriteRTP error: %v", err)
-				}
-			} else {
-				c.Send += n
-			}
-		}
-	}
-
 	<-deadline.C
 
 	return nil
