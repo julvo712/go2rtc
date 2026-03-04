@@ -1,6 +1,7 @@
 package srtp
 
 import (
+	"log"
 	"net"
 	"time"
 
@@ -25,6 +26,7 @@ type Session struct {
 
 	senderRTCP rtcp.SenderReport
 	senderTime time.Time
+	writeCount int
 }
 
 type Endpoint struct {
@@ -104,7 +106,14 @@ func (s *Session) WriteRTP(packet *rtp.Packet) (int, error) {
 		return 0, err
 	}
 
-	return s.conn.WriteTo(b, s.Remote.addr)
+	n, err := s.conn.WriteTo(b, s.Remote.addr)
+	s.writeCount++
+	if s.writeCount <= 3 {
+		log.Printf("[srtp] WriteRTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d → dest=%s encLen=%d written=%d err=%v from=%s",
+			s.writeCount, clone.PayloadType, clone.SSRC, clone.SequenceNumber, clone.Timestamp,
+			len(clone.Payload), s.Remote.addr, len(b), n, err, s.conn.LocalAddr())
+	}
+	return n, err
 }
 
 func (s *Session) WriteRTCP(packet rtcp.Packet) (int, error) {

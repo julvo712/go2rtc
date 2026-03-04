@@ -2,6 +2,7 @@ package srtp
 
 import (
 	"encoding/binary"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -74,8 +75,9 @@ func (s *Server) GetSession(ssrc uint32) (session *Session) {
 
 func (s *Server) handle() error {
 	b := make([]byte, 2048)
+	var readCount int
 	for {
-		n, _, err := s.conn.ReadFrom(b)
+		n, addr, err := s.conn.ReadFrom(b)
 		if err != nil {
 			return err
 		}
@@ -88,6 +90,11 @@ func (s *Server) handle() error {
 			// this is default position for SSRC in RTP packet
 			ssrc := binary.BigEndian.Uint32(b[8:])
 			if session := s.GetSession(ssrc); session != nil {
+				readCount++
+				if readCount <= 3 {
+					log.Printf("[srtp] ReadRTP #%d: PT=%d SSRC=%d from=%s remoteAddr=%s len=%d",
+						readCount, packetType, ssrc, addr, session.Remote.addr, n)
+				}
 				session.ReadRTP(b[:n])
 			}
 
