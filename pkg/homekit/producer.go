@@ -3,6 +3,7 @@ package homekit
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"time"
@@ -32,6 +33,8 @@ type Client struct {
 	backchannel      *backchannelPipeline // ffmpeg Opus→AAC-ELD transcoder
 	backchannelCodec *core.Codec          // codec of the backchannel track (for deferred start)
 	backchannelTrack *core.Receiver       // backchannel track (for deferred start)
+
+	forwardAudio *forwardAudioPipeline // ffmpeg ELD→Opus transcoder (camera mic → browser)
 
 	MaxWidth  int `json:"-"`
 	MaxHeight int `json:"-"`
@@ -92,9 +95,18 @@ func (c *Client) GetMedias() []*core.Media {
 
 	c.SDP = fmt.Sprintf("%+v\n%+v", c.videoConfig, c.audioConfig)
 
+	// Recvonly audio: camera's native codecs (ELD) plus Opus for transcoded output.
+	// If a consumer only speaks Opus (e.g. WebRTC), we transcode ELD→Opus in Start().
+	recvAudio := audioToMedia(c.audioConfig.Codecs, core.DirectionRecvonly)
+	recvAudio.Codecs = append(recvAudio.Codecs, &core.Codec{
+		Name:      core.CodecOpus,
+		ClockRate: 48000,
+		Channels:  2,
+	})
+
 	c.Medias = []*core.Media{
 		videoToMedia(c.videoConfig.Codecs),
-		audioToMedia(c.audioConfig.Codecs, core.DirectionRecvonly),
+		recvAudio,
 		{
 			Kind:      core.KindVideo,
 			Direction: core.DirectionRecvonly,
@@ -200,7 +212,9 @@ func (c *Client) Start() error {
 	videoCodec := trackToVideo(videoTrack, &c.videoConfig.Codecs[0], c.MaxWidth, c.MaxHeight)
 
 	audioTrack := c.trackByKind(core.KindAudio)
-	audioCodec := trackToAudio(audioTrack, &c.audioConfig.Codecs[0])
+	// Always negotiate camera's native ELD codec, regardless of consumer codec.
+	// If the consumer wants Opus, we transcode ELD→Opus via ffmpeg below.
+	audioCodec := trackToAudio(nil, &c.audioConfig.Codecs[0])
 
 	c.videoSession = &srtp.Session{Local: c.srtpEndpoint()}
 	c.audioSession = &srtp.Session{Local: c.srtpEndpoint()}
@@ -231,29 +245,46 @@ func (c *Client) Start() error {
 
 	deadline := time.NewTimer(core.ConnDeadline)
 
+	// Set up video handler
 	if videoTrack != nil {
 		c.videoSession.OnReadRTP = func(packet *rtp.Packet) {
 			deadline.Reset(core.ConnDeadline)
 			videoTrack.WriteRTP(packet)
 			c.Recv += len(packet.Payload)
 		}
+	}
 
-		if audioTrack != nil {
-			c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
+	// Set up audio handler (with ELD→Opus transcoding if needed)
+	if audioTrack != nil {
+		needsDeadline := videoTrack == nil
+		needsTranscoding := audioTrack.Codec.Name == core.CodecOpus
+
+		if needsTranscoding {
+			log.Printf("[homekit] audio track is Opus, setting up ELD→Opus transcoding")
+			fwd, err := startForwardAudioPipeline(audioTrack, &c.Recv)
+			if err != nil {
+				log.Printf("[homekit] forward audio failed: %v", err)
+			} else {
+				c.forwardAudio = fwd
+				c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
+					if needsDeadline {
+						deadline.Reset(core.ConnDeadline)
+					}
+					fwd.WriteELDPacket(packet)
+					c.Recv += len(packet.Payload)
+				}
+			}
+		} else {
+			// Direct ELD passthrough (consumer natively supports ELD)
+			handler := func(packet *rtp.Packet) {
+				if needsDeadline {
+					deadline.Reset(core.ConnDeadline)
+				}
 				audioTrack.WriteRTP(packet)
 				c.Recv += len(packet.Payload)
 			}
+			c.audioSession.OnReadRTP = timekeeper(handler)
 		}
-	} else {
-		c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
-			deadline.Reset(core.ConnDeadline)
-			audioTrack.WriteRTP(packet)
-			c.Recv += len(packet.Payload)
-		}
-	}
-
-	if c.audioSession.OnReadRTP != nil {
-		c.audioSession.OnReadRTP = timekeeper(c.audioSession.OnReadRTP)
 	}
 
 	<-deadline.C
@@ -264,6 +295,9 @@ func (c *Client) Start() error {
 func (c *Client) Stop() error {
 	if c.backchannel != nil {
 		c.backchannel.Close()
+	}
+	if c.forwardAudio != nil {
+		c.forwardAudio.Close()
 	}
 
 	if c.videoSession != nil && c.videoSession.Remote != nil {
