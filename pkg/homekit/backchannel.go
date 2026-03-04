@@ -195,7 +195,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 // format sets GLOBAL_HEADER (which selects RAW transport — unsupported for ELD).
 // LATM output uses LOAS transport which supports ELD.
 func (p *backchannelPipeline) startTwoProcess(ctx context.Context, encoderBin, sdpFile string, outputPort int) error {
-	log.Printf("[backchannel] using two-process mode: %s (libfdk_aac → LATM) | ffmpeg (LATM → RTP)", encoderBin)
+	log.Printf("[backchannel] using two-process mode: %s (libfdk_aac → LATM | LATM → RTP)", encoderBin)
 
 	// Process 1: Opus RTP → AAC-ELD LATM (stdout)
 	encoder := exec.CommandContext(ctx, encoderBin,
@@ -207,7 +207,8 @@ func (p *backchannelPipeline) startTwoProcess(ctx context.Context, encoderBin, s
 		"-f", "latm", "pipe:1")
 
 	// Process 2: LATM (stdin) → RTP UDP
-	muxer := exec.CommandContext(ctx, "ffmpeg",
+	// Use the same binary as the encoder — system ffmpeg may lack LATM demuxer
+	muxer := exec.CommandContext(ctx, encoderBin,
 		"-hide_banner", "-loglevel", "error",
 		"-f", "latm", "-i", "pipe:0",
 		"-c:a", "copy",
