@@ -103,14 +103,17 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		cancel:  cancel,
 	}
 
-	// Try pipe mode with libfdk_aac (proper 480-sample AAC-ELD frames)
-	eldEncoder := findELDEncoder()
-	if eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName); err != nil {
-			log.Printf("[backchannel] pipe mode failed: %v, falling back to native", err)
-			eldEncoder = ""
-		}
-	}
+	// DEBUG: force native RTP mode to test if SRTP layer works without LOAS parsing.
+	// TODO: remove this once backchannel is confirmed working.
+	eldEncoder := ""
+	log.Printf("[backchannel] DEBUG: forcing native AAC encoder RTP mode (bypassing LOAS)")
+	// eldEncoder := findELDEncoder()
+	// if eldEncoder != "" {
+	// 	if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName); err != nil {
+	// 		log.Printf("[backchannel] pipe mode failed: %v, falling back to native", err)
+	// 		eldEncoder = ""
+	// 	}
+	// }
 
 	// Fall back to RTP mode with native AAC encoder
 	if eldEncoder == "" {
@@ -573,6 +576,13 @@ func (p *backchannelPipeline) readRTPAndSend(session *srtp.Session, sendCounter 
 
 			if sent, err := session.WriteRTP(singlePacket); err == nil {
 				*sendCounter += sent
+				if totalRead <= 3 {
+					log.Printf("[backchannel] RTP sent frame %d/%d: auSize=%d sent=%d seq=%d ts=%d remote=%v",
+						i+1, numFrames, auSize, sent, seq-1, timestamp-timestampIncrement,
+						session.Remote != nil)
+				}
+			} else if totalRead <= 3 {
+				log.Printf("[backchannel] RTP send ERROR: %v remote=%v", err, session.Remote)
 			}
 		}
 	}
