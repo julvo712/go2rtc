@@ -29,6 +29,10 @@ type Client struct {
 
 	stream *camera.Stream
 
+	backchannel      *backchannelPipeline // ffmpeg Opus→AAC-ELD transcoder
+	backchannelCodec *core.Codec          // codec of the backchannel track (for deferred start)
+	backchannelTrack *core.Receiver       // backchannel track (for deferred start)
+
 	MaxWidth  int `json:"-"`
 	MaxHeight int `json:"-"`
 	Bitrate   int `json:"-"` // in bits/s
@@ -90,7 +94,7 @@ func (c *Client) GetMedias() []*core.Media {
 
 	c.Medias = []*core.Media{
 		videoToMedia(c.videoConfig.Codecs),
-		audioToMedia(c.audioConfig.Codecs),
+		audioToMedia(c.audioConfig.Codecs, core.DirectionRecvonly),
 		{
 			Kind:      core.KindVideo,
 			Direction: core.DirectionRecvonly,
@@ -104,7 +108,78 @@ func (c *Client) GetMedias() []*core.Media {
 		},
 	}
 
+	// If the camera has a Speaker service, advertise sendonly audio media
+	// so that backchannel audio (e.g. from WebRTC mic) can be routed to
+	// the camera's speaker via the existing SRTP session.
+	// We advertise both the camera's native codec (AAC-ELD) and Opus,
+	// since the ffmpeg transcoding pipeline in startBackchannel() can
+	// convert Opus → AAC-ELD. This allows WebRTC consumers (which
+	// typically send Opus) to match the backchannel media.
+	if acc.GetService(camera.TypeSpeaker) != nil {
+		backchannel := audioToMedia(c.audioConfig.Codecs, core.DirectionSendonly)
+		backchannel.Codecs = append(backchannel.Codecs, &core.Codec{
+			Name:      core.CodecOpus,
+			ClockRate: 48000,
+			Channels:  2,
+		})
+		c.Medias = append(c.Medias, backchannel)
+	}
+
 	return c.Medias
+}
+
+func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
+	if media.Direction != core.DirectionSendonly {
+		return errors.New("homekit: AddTrack only for sendonly (backchannel)")
+	}
+
+	// Save the backchannel track info for deferred start. The SRTP audio
+	// session doesn't exist yet — it's created in Start(). The actual
+	// ffmpeg pipeline and sender handler are wired up in startBackchannel()
+	// which is called from Start() after the SRTP session is established.
+	c.backchannelCodec = codec
+	c.backchannelTrack = track
+
+	return nil
+}
+
+// startBackchannel wires up the backchannel audio pipeline after the SRTP
+// session has been established. Must be called from Start().
+func (c *Client) startBackchannel() error {
+	codec := c.backchannelCodec
+	track := c.backchannelTrack
+
+	media := &core.Media{
+		Kind:      core.KindAudio,
+		Direction: core.DirectionSendonly,
+		Codecs:    []*core.Codec{codec},
+	}
+
+	sender := core.NewSender(media, track.Codec)
+
+	// The camera only speaks AAC-ELD. If the incoming track is already AAC-ELD,
+	// we can forward directly. Otherwise we need ffmpeg transcoding (typically
+	// Opus from WebRTC → AAC-ELD for the camera).
+	if codec.Name == core.CodecELD || codec.Name == core.CodecAAC {
+		// Direct path: incoming AAC-ELD → SRTP → camera
+		sender.Handler = func(packet *rtp.Packet) {
+			if n, err := c.audioSession.WriteRTP(packet); err == nil {
+				c.Send += n
+			}
+		}
+	} else {
+		// Transcoding path: spawn ffmpeg Opus→AAC-ELD pipeline
+		pipeline, handler, err := startBackchannelPipeline(c.audioSession, &c.Send)
+		if err != nil {
+			return fmt.Errorf("homekit: backchannel pipeline: %w", err)
+		}
+		c.backchannel = pipeline
+		sender.Handler = handler
+	}
+
+	sender.HandleRTP(track)
+	c.Senders = append(c.Senders, sender)
+	return nil
 }
 
 func (c *Client) Start() error {
@@ -133,6 +208,21 @@ func (c *Client) Start() error {
 
 	c.srtp.AddSession(c.videoSession)
 	c.srtp.AddSession(c.audioSession)
+
+	// Store PayloadType and RTCPInterval so that WriteRTP (backchannel)
+	// uses the correct values when sending audio to the camera.
+	c.videoSession.PayloadType = videoCodec.RTPParams[0].PayloadType
+	c.videoSession.RTCPInterval = toDuration(videoCodec.RTPParams[0].RTCPInterval)
+	c.audioSession.PayloadType = audioCodec.RTPParams[0].PayloadType
+	c.audioSession.RTCPInterval = toDuration(audioCodec.RTPParams[0].RTCPInterval)
+
+	// Start backchannel pipeline if a backchannel track was registered via AddTrack
+	if c.backchannelTrack != nil {
+		if err := c.startBackchannel(); err != nil {
+			// Backchannel failure is non-fatal — video/audio reception still works
+			_ = err
+		}
+	}
 
 	deadline := time.NewTimer(core.ConnDeadline)
 
@@ -167,6 +257,10 @@ func (c *Client) Start() error {
 }
 
 func (c *Client) Stop() error {
+	if c.backchannel != nil {
+		c.backchannel.Close()
+	}
+
 	if c.videoSession != nil && c.videoSession.Remote != nil {
 		c.srtp.DelSession(c.videoSession)
 	}
