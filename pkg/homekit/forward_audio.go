@@ -45,10 +45,11 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	}
 	opusPort := opusListener.LocalAddr().(*net.UDPAddr).Port
 
-	// AudioSpecificConfig for AAC-ELD 16kHz mono, no SBR.
-	// The previous "Internal bug" error was from the native AAC decoder;
-	// libfdk_aac (used below) handles this config correctly.
-	configHex := "f8f03000"
+	// AudioSpecificConfig for AAC-ELD 16kHz mono with LD-SBR.
+	// Based on homebridge config F8F0212C00BC00 but with frameLengthFlag=1
+	// (480 samples) instead of 0 (512 samples), matching the camera's actual
+	// frame size visible from RTP timestamp increments of 480.
+	configHex := "F8F0312C00BC00"
 
 	sdp := fmt.Sprintf(
 		"v=0\r\n"+
