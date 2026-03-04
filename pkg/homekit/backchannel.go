@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -92,8 +93,12 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		if testOut, err := testCmd.Output(); err == nil && bytes.Contains(testOut, []byte("libfdk_aac")) {
 			ffmpegBin = bin
 			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld"
+			log.Printf("[backchannel] using %s with libfdk_aac", bin)
 			break
 		}
+	}
+	if ffmpegBin == "ffmpeg" {
+		log.Printf("[backchannel] WARNING: libfdk_aac not found, using native AAC encoder")
 	}
 
 	ffmpegCmd := fmt.Sprintf(
@@ -105,9 +110,12 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		ffmpegBin, sdpFileName, ffmpegCodec, outputPort,
 	)
 
+	log.Printf("[backchannel] ffmpeg cmd: %s", ffmpegCmd)
+	log.Printf("[backchannel] SDP content:\n%s", sdp)
+
 	cmd := shell.NewCommand(ffmpegCmd)
 
-	// Capture stderr for debugging (drain it to avoid blocking ffmpeg)
+	// Capture stderr for debugging
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
@@ -122,15 +130,21 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		sdpFile: sdpFileName,
 	}
 
-	// Drain ffmpeg stderr in background
+	// Log ffmpeg stderr in background
 	if stderr != nil {
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				// stderr is drained; messages visible if debug logging is added
+				log.Printf("[backchannel] ffmpeg stderr: %s", scanner.Text())
 			}
 		}()
 	}
+
+	// Log when ffmpeg exits
+	go func() {
+		<-cmd.Done()
+		log.Printf("[backchannel] ffmpeg process exited")
+	}()
 
 	// Start goroutine to read AAC-ELD RTP from ffmpeg output and send to camera
 	go pipeline.readAndSend(session, sendCounter)
@@ -145,6 +159,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	pipeline.sendConn = sendConn
 
 	var seq uint16
+	var handlerCount int
 	handler := func(packet *rtp.Packet) {
 		// Re-create a clean RTP packet with the correct payload type
 		// matching our SDP (PT 111 = Opus)
@@ -160,13 +175,21 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 			Payload: packet.Payload,
 		}
 		seq++
+		handlerCount++
+
+		if handlerCount <= 3 {
+			log.Printf("[backchannel] handler sending Opus packet #%d to ffmpeg: payloadLen=%d ts=%d",
+				handlerCount, len(packet.Payload), packet.Timestamp)
+		}
 
 		b, err := clone.Marshal()
 		if err != nil {
 			return
 		}
 
-		sendConn.Write(b)
+		if _, err := sendConn.Write(b); err != nil && handlerCount <= 3 {
+			log.Printf("[backchannel] handler Write error: %v", err)
+		}
 	}
 
 	// Clean up send socket when ffmpeg exits
@@ -193,6 +216,9 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 	const timestampIncrement = 480
 	var timestamp uint32
 	var seq uint16
+	var totalRead int
+
+	log.Printf("[backchannel] readAndSend started, listening on %s", p.udpConn.LocalAddr())
 
 	for {
 		n, _, err := p.udpConn.ReadFrom(buf)
@@ -201,20 +227,30 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 			closed := p.closed
 			p.mu.Unlock()
 			if !closed {
-				// Unexpected read error — pipeline may need restart
+				log.Printf("[backchannel] readAndSend unexpected error: %v", err)
 			}
+			log.Printf("[backchannel] readAndSend exiting, totalRead=%d", totalRead)
 			return
+		}
+
+		totalRead++
+		if totalRead <= 3 {
+			log.Printf("[backchannel] readAndSend got packet #%d: %d bytes", totalRead, n)
 		}
 
 		// Parse the RTP packet from ffmpeg
 		packet := &rtp.Packet{}
 		if err := packet.Unmarshal(buf[:n]); err != nil {
+			log.Printf("[backchannel] readAndSend unmarshal error: %v", err)
 			continue
 		}
 
 		// Unpack RFC 3640 AU headers and send each AAC frame individually
 		payload := packet.Payload
 		if len(payload) < 4 {
+			if totalRead <= 3 {
+				log.Printf("[backchannel] readAndSend payload too short: %d", len(payload))
+			}
 			continue
 		}
 
@@ -231,11 +267,17 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 		headers := payload[2 : 2+auHeadersLen]
 		data := payload[2+auHeadersLen:]
 
+		if totalRead <= 3 {
+			log.Printf("[backchannel] readAndSend PT=%d numFrames=%d auHeadersLen=%d dataLen=%d",
+				packet.PayloadType, numFrames, auHeadersLen, len(data))
+		}
+
 		for i := 0; i < numFrames && len(headers) >= 2; i++ {
 			auSize := (int(headers[0])<<8 | int(headers[1])) >> 3 // 13-bit size
 			headers = headers[2:]
 
 			if auSize > len(data) {
+				log.Printf("[backchannel] readAndSend auSize %d > dataLen %d", auSize, len(data))
 				break
 			}
 
@@ -264,6 +306,8 @@ func (p *backchannelPipeline) readAndSend(session *srtp.Session, sendCounter *in
 
 			if sent, err := session.WriteRTP(singlePacket); err == nil {
 				*sendCounter += sent
+			} else if totalRead <= 3 {
+				log.Printf("[backchannel] readAndSend WriteRTP error: %v", err)
 			}
 		}
 	}
