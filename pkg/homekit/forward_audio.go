@@ -24,6 +24,7 @@ type forwardAudioPipeline struct {
 	sdpFile  string
 	mu       sync.Mutex
 	closed   bool
+	pktCount int
 }
 
 // startForwardAudioPipeline sets up an ffmpeg process that decodes AAC-ELD RTP
@@ -44,12 +45,10 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	}
 	opusPort := opusListener.LocalAddr().(*net.UDPAddr).Port
 
-	// AudioSpecificConfig for AAC-ELD 16kHz mono.
-	// Use the homebridge-proven config which includes SBR parameters,
-	// matching what HomeKit cameras actually send.
-	// Fallback configs to try if this fails: "f8ec3000" (24kHz no-SBR),
-	// "f8f03000" (16kHz no-SBR).
-	configHex := "F8F0212C00BC00"
+	// AudioSpecificConfig for AAC-ELD 16kHz mono, no SBR.
+	// The previous "Internal bug" error was from the native AAC decoder;
+	// libfdk_aac (used below) handles this config correctly.
+	configHex := "f8f03000"
 
 	sdp := fmt.Sprintf(
 		"v=0\r\n"+
@@ -90,7 +89,7 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cmd := exec.CommandContext(ctx, ffmpegBin,
-		"-hide_banner", "-loglevel", "warning",
+		"-hide_banner", "-loglevel", "info",
 		"-c:a", "libfdk_aac", // input decoder: supports LD-SBR
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFileName,
@@ -139,6 +138,21 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 
 // WriteELDPacket forwards a decrypted ELD RTP packet from the camera to ffmpeg.
 func (p *forwardAudioPipeline) WriteELDPacket(packet *rtp.Packet) {
+	p.mu.Lock()
+	p.pktCount++
+	n := p.pktCount
+	p.mu.Unlock()
+
+	if n <= 5 {
+		hexDump := fmt.Sprintf("%x", packet.Payload)
+		if len(hexDump) > 64 {
+			hexDump = hexDump[:64] + "..."
+		}
+		log.Printf("[forward-audio] camera RTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d first=%s",
+			n, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Timestamp,
+			len(packet.Payload), hexDump)
+	}
+
 	b, err := packet.Marshal()
 	if err != nil {
 		return
