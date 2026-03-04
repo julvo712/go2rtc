@@ -82,30 +82,28 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	sdpFile.Close()
 
 	// Spawn ffmpeg to transcode Opus RTP → AAC-ELD RTP
-	// Try libfdk_aac first (produces correct 480-sample ELD frames),
-	// fall back to native aac encoder (produces 1024-sample frames,
-	// which we split and re-timestamp in readAndSend).
+	// Prefer ffmpeg-fdk (custom build with libfdk_aac) which produces correct
+	// 480-sample AAC-ELD frames. Fall back to system ffmpeg with native encoder
+	// (1024-sample frames, split in readAndSend).
+	ffmpegBin := "ffmpeg"
+	ffmpegCodec := "-c:a aac -profile:a aac_eld"
+	for _, bin := range []string{"/usr/local/bin/ffmpeg-fdk", "ffmpeg-fdk", "ffmpeg"} {
+		testCmd := shell.NewCommand(bin + " -hide_banner -loglevel error -encoders")
+		if testOut, err := testCmd.Output(); err == nil && bytes.Contains(testOut, []byte("libfdk_aac")) {
+			ffmpegBin = bin
+			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld"
+			break
+		}
+	}
+
 	ffmpegCmd := fmt.Sprintf(
-		"ffmpeg -hide_banner -loglevel error"+
+		"%s -hide_banner -loglevel error"+
 			" -protocol_whitelist file,rtp,udp"+
 			" -f sdp -i %s"+
-			" -c:a libfdk_aac -profile:a aac_eld -ar 16000 -ac 1 -b:a 24k"+
+			" %s -ar 16000 -ac 1 -b:a 24k"+
 			" -f rtp rtp://127.0.0.1:%d",
-		sdpFileName, outputPort,
+		ffmpegBin, sdpFileName, ffmpegCodec, outputPort,
 	)
-
-	// Test if libfdk_aac is available; if not, fall back to native encoder
-	testCmd := shell.NewCommand("ffmpeg -hide_banner -loglevel error -encoders 2>&1")
-	if testOut, err := testCmd.Output(); err != nil || !bytes.Contains(testOut, []byte("libfdk_aac")) {
-		ffmpegCmd = fmt.Sprintf(
-			"ffmpeg -hide_banner -loglevel error"+
-				" -protocol_whitelist file,rtp,udp"+
-				" -f sdp -i %s"+
-				" -c:a aac -profile:a aac_eld -ar 16000 -ac 1 -b:a 24k"+
-				" -f rtp rtp://127.0.0.1:%d",
-			sdpFileName, outputPort,
-		)
-	}
 
 	cmd := shell.NewCommand(ffmpegCmd)
 
