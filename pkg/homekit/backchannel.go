@@ -2,7 +2,6 @@ package homekit
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -83,22 +82,29 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	sdpFile.Close()
 
 	// Spawn ffmpeg to transcode Opus RTP → AAC-ELD RTP
-	// Prefer ffmpeg-fdk (custom build with libfdk_aac) which produces correct
-	// 480-sample AAC-ELD frames. Fall back to system ffmpeg with native encoder
-	// (1024-sample frames, split in readAndSend).
-	ffmpegBin := "ffmpeg"
-	ffmpegCodec := "-c:a aac -profile:a aac_eld"
-	for _, bin := range []string{"/usr/local/bin/ffmpeg-fdk", "ffmpeg-fdk", "ffmpeg"} {
-		testCmd := shell.NewCommand(bin + " -hide_banner -loglevel error -encoders")
-		if testOut, err := testCmd.Output(); err == nil && bytes.Contains(testOut, []byte("libfdk_aac")) {
+	// Prefer an ffmpeg with libfdk_aac that can actually encode AAC-ELD.
+	// The system libfdk-aac package may not support ELD with RAW transport,
+	// so we test actual encoding rather than just checking -encoders.
+	// Recommended: install homebridge static ffmpeg which bundles working libfdk-aac:
+	//   curl -Lf https://github.com/homebridge/ffmpeg-for-homebridge/releases/latest/download/ffmpeg-alpine-x86_64.tar.gz | tar xzf - -C /tmp && cp /tmp/usr/local/bin/ffmpeg /usr/local/bin/ffmpeg-homebridge
+	ffmpegBin := ""
+	ffmpegCodec := ""
+	for _, bin := range []string{"/usr/local/bin/ffmpeg-homebridge", "/usr/local/bin/ffmpeg-fdk", "ffmpeg-fdk", "ffmpeg"} {
+		// Actually test AAC-ELD encoding — some libfdk-aac versions fail at init
+		testCmd := shell.NewCommand(bin + " -hide_banner -loglevel error -f lavfi -i sine=frequency=440:duration=0.1 -c:a libfdk_aac -profile:a aac_eld -ar 16000 -ac 1 -f null /dev/null")
+		if err := testCmd.Run(); err == nil {
 			ffmpegBin = bin
-			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld -eld_sbr 0"
-			log.Printf("[backchannel] using %s with libfdk_aac", bin)
+			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld"
+			log.Printf("[backchannel] using %s with libfdk_aac (ELD test passed)", bin)
 			break
 		}
 	}
-	if ffmpegBin == "ffmpeg" {
-		log.Printf("[backchannel] WARNING: libfdk_aac not found, using native AAC encoder")
+	if ffmpegBin == "" {
+		// Fall back to native AAC encoder (produces 1024-sample frames,
+		// split into individual frames in readAndSend)
+		ffmpegBin = "ffmpeg"
+		ffmpegCodec = "-c:a aac -profile:a aac_eld"
+		log.Printf("[backchannel] WARNING: no ffmpeg with working libfdk_aac ELD found, using native encoder")
 	}
 
 	ffmpegCmd := fmt.Sprintf(
