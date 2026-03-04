@@ -92,7 +92,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		testCmd := shell.NewCommand(bin + " -hide_banner -loglevel error -encoders")
 		if testOut, err := testCmd.Output(); err == nil && bytes.Contains(testOut, []byte("libfdk_aac")) {
 			ffmpegBin = bin
-			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld"
+			ffmpegCodec = "-c:a libfdk_aac -profile:a aac_eld -eld_sbr 0"
 			log.Printf("[backchannel] using %s with libfdk_aac", bin)
 			break
 		}
@@ -105,7 +105,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		"%s -hide_banner -loglevel error"+
 			" -protocol_whitelist file,rtp,udp"+
 			" -f sdp -i %s"+
-			" %s -ar 16000 -ac 1 -b:a 24k"+
+			" %s -ar 16000 -ac 1 -b:a 32k"+
 			" -f rtp rtp://127.0.0.1:%d",
 		ffmpegBin, sdpFileName, ffmpegCodec, outputPort,
 	)
