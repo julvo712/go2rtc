@@ -79,10 +79,19 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	// Close the ELD listener so ffmpeg can bind to the same port
 	eldListener.Close()
 
+	// Use ffmpeg-homebridge (libfdk_aac) for decoding — the native AAC decoder
+	// doesn't support Low Delay SBR which HomeKit cameras use.
+	ffmpegBin := findELDEncoder()
+	if ffmpegBin == "" {
+		ffmpegBin = "ffmpeg" // fallback
+	}
+	log.Printf("[forward-audio] using decoder: %s", ffmpegBin)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cmd := exec.CommandContext(ctx, "ffmpeg",
+	cmd := exec.CommandContext(ctx, ffmpegBin,
 		"-hide_banner", "-loglevel", "warning",
+		"-c:a", "libfdk_aac", // input decoder: supports LD-SBR
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFileName,
 		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
