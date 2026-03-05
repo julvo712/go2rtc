@@ -176,45 +176,35 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	}
 
 	eldEncoder := findELDEncoder()
-	var hasSBR, hasFrameLength bool
+	var hasFrameLength bool
 	if eldEncoder != "" {
-		hasSBR, hasFrameLength = probeELDCapabilities(eldEncoder)
+		_, hasFrameLength = probeELDCapabilities(eldEncoder)
 	}
-	log.Printf("[backchannel] encoder=%q hasSBR=%v hasFrameLength=%v", eldEncoder, hasSBR, hasFrameLength)
 
-	// Build encoder args that match the camera's AudioSpecificConfig:
-	// AAC-ELD, 16kHz, mono, 480-sample frames, LD-SBR
-	encoderArgs := eldEncoderArgs(hasSBR, hasFrameLength)
+	// Build encoder args for pipe mode (no -eld_sbr, since it requires -latm 1
+	// which causes double-wrapping with -f latm muxer).
+	// Use -frame_length 480 if available (matches camera's 480-sample frames).
+	var pipeArgs []string
+	if hasFrameLength {
+		pipeArgs = []string{"-frame_length", "480"}
+	}
+	log.Printf("[backchannel] encoder=%q hasFrameLength=%v pipeArgs=%v", eldEncoder, hasFrameLength, pipeArgs)
+
 	var started bool
 
-	// Mode 1: Try libfdk_aac with RTP output (best: no LOAS parsing needed)
-	if eldEncoder != "" && canEncodeELDViaRTP(eldEncoder, encoderArgs) {
-		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err == nil {
-			pipeline.udpConn = outputConn
-			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
-				outputConn.LocalAddr().(*net.UDPAddr).Port, encoderArgs); err != nil {
-				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
-				outputConn.Close()
-				pipeline.udpConn = nil
-			} else {
-				started = true
-				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP) ===")
-			}
-		}
-	}
-
-	// Mode 2: Try libfdk_aac with LATM pipe (needs LOAS parsing)
-	if !started && eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, encoderArgs); err != nil {
+	// Mode 1: Try libfdk_aac with LATM pipe (LOAS parsing)
+	// This is the preferred mode for libfdk_aac since -f rtp doesn't work
+	// reliably with ELD on all ffmpeg builds.
+	if eldEncoder != "" {
+		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, pipeArgs); err != nil {
 			log.Printf("[backchannel] pipe mode failed: %v", err)
 		} else {
 			started = true
-			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac → LATM → LOAS parse) ===")
+			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac, frameLen=%v) ===", hasFrameLength)
 		}
 	}
 
-	// Mode 3: Fall back to RTP mode with native AAC encoder
+	// Mode 2: Fall back to RTP mode with native AAC encoder
 	if !started {
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
