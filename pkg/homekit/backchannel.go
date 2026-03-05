@@ -176,31 +176,20 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	}
 
 	eldEncoder := findELDEncoder()
-	var hasFrameLength bool
-	if eldEncoder != "" {
-		_, hasFrameLength = probeELDCapabilities(eldEncoder)
-	}
-
-	// Build encoder args for pipe mode (no -eld_sbr, since it requires -latm 1
-	// which causes double-wrapping with -f latm muxer).
-	// Use -frame_length 480 if available (matches camera's 480-sample frames).
-	var pipeArgs []string
-	if hasFrameLength {
-		pipeArgs = []string{"-frame_length", "480"}
-	}
-	log.Printf("[backchannel] encoder=%q hasFrameLength=%v pipeArgs=%v", eldEncoder, hasFrameLength, pipeArgs)
+	log.Printf("[backchannel] encoder=%q", eldEncoder)
 
 	var started bool
 
-	// Mode 1: Try libfdk_aac with LATM pipe (LOAS parsing)
-	// This is the preferred mode for libfdk_aac since -f rtp doesn't work
-	// reliably with ELD on all ffmpeg builds.
+	// Mode 1: libfdk_aac with LATM pipe output → LOAS parsing → SRTP
+	// Uses plain AAC-ELD (no -eld_sbr, no -frame_length — both require
+	// -latm 1 which double-wraps LOAS with -f latm muxer).
+	// Homebridge also uses plain ELD and works with most cameras.
 	if eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, pipeArgs); err != nil {
+		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, nil); err != nil {
 			log.Printf("[backchannel] pipe mode failed: %v", err)
 		} else {
 			started = true
-			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac, frameLen=%v) ===", hasFrameLength)
+			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac, plain ELD) ===")
 		}
 	}
 
