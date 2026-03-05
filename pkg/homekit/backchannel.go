@@ -180,20 +180,39 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 
 	var started bool
 
-	// Mode 1: libfdk_aac with LATM pipe output → LOAS parsing → SRTP
-	// Uses plain AAC-ELD (no -eld_sbr, no -frame_length — both require
-	// -latm 1 which double-wraps LOAS with -f latm muxer).
-	// Homebridge also uses plain ELD and works with most cameras.
-	if eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, nil); err != nil {
-			log.Printf("[backchannel] pipe mode failed: %v", err)
-		} else {
-			started = true
-			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac, plain ELD) ===")
+	// Mode 1: libfdk_aac with RTP output (cleanest: ffmpeg handles RFC 3640)
+	// -f rtp sets AVFMT_GLOBALHEADER → AACENC_TRANSMUX=TT_MP4_RAW.
+	if !started && eldEncoder != "" {
+		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err == nil {
+			pipeline.udpConn = outputConn
+			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
+				outputConn.LocalAddr().(*net.UDPAddr).Port); err != nil {
+				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
+				outputConn.Close()
+				pipeline.udpConn = nil
+			} else {
+				started = true
+				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP) ===")
+			}
 		}
 	}
 
-	// Mode 2: Fall back to RTP mode with native AAC encoder
+	// Mode 2: libfdk_aac with LATM pipe (-latm 1 required for ELD).
+	// -latm 1 sets AACENC_TRANSMUX=TT_MP4_LOAS. Without it, the encoder
+	// defaults to ADTS which only supports AAC-LC.
+	// The -f latm muxer detects LOAS in the packets and passes through
+	// raw (NOT double-wrapping).
+	if !started && eldEncoder != "" {
+		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName); err != nil {
+			log.Printf("[backchannel] pipe mode failed: %v", err)
+		} else {
+			started = true
+			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac) ===")
+		}
+	}
+
+	// Mode 3: Fall back to RTP mode with native AAC encoder
 	if !started {
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
@@ -264,19 +283,17 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 }
 
 // startRTPModeFDK launches ffmpeg with libfdk_aac, outputting RFC 3640 RTP
-// directly to a UDP port. This is the preferred mode because it avoids LOAS
-// parsing entirely — ffmpeg handles the AAC → RTP framing natively.
-func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile string, outputPort int, extraArgs []string) error {
+// directly to a UDP port. The RTP muxer sets AVFMT_GLOBALHEADER which forces
+// AACENC_TRANSMUX=TT_MP4_RAW, bypassing the ADTS limitation for ELD.
+func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile string, outputPort int) error {
 	args := []string{
 		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
-	}
-	args = append(args, extraArgs...)
-	args = append(args,
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
-		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort),
+	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	log.Printf("[backchannel] RTP-FDK cmd: %s", cmd.String())
@@ -315,17 +332,28 @@ func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile 
 
 // startPipeMode launches ffmpeg with libfdk_aac, outputting LATM to stdout.
 // We parse LOAS frames from stdout and send raw AAC-ELD frames via SRTP.
-func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string, extraArgs []string) error {
+//
+// -latm 1 is REQUIRED: without it, the encoder defaults to TT_MP4_ADTS which
+// only supports AAC-LC. With -latm 1, TT_MP4_LOAS is used, and the -f latm
+// muxer detects LOAS in the packet data and passes it through raw (no
+// double-wrapping — confirmed by reading ffmpeg latmenc.c source).
+func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string) error {
+	// Probe for optional encoder features
+	hasSBR, hasFrameLength := probeELDCapabilities(bin)
+
 	args := []string{
 		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
+		"-latm", "1", // REQUIRED for AAC-ELD (ADTS doesn't support ELD)
 	}
-	args = append(args, extraArgs...)
-	// NOTE: Do NOT add -latm 1 here. That tells the encoder to output LOAS
-	// internally, but -f latm already wraps in LOAS. Using both causes
-	// double-wrapping and corrupts the AudioSpecificConfig.
+	if hasFrameLength {
+		args = append(args, "-frame_length", "480")
+	}
+	if hasSBR {
+		args = append(args, "-eld_sbr", "1")
+	}
 	args = append(args,
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "latm", "pipe:1")
