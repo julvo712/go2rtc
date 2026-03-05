@@ -1,0 +1,13 @@
+services:
+  go2rtc:
+    build: .
+    # On Linux (production): uncomment network_mode and remove ports
+    # network_mode: host
+    ports:
+      - "1984:1984"
+      - "8554:8554"
+      - "8555:8555"
+      - "8555:8555/udp"
+    volumes:
+      - ./config:/config
+    restart: unless-stopped
