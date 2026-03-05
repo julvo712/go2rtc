@@ -62,9 +62,9 @@ func findELDEncoder() string {
 }
 
 // canEncodeELDViaRTP tests if an ffmpeg binary can encode AAC-ELD with
-// libfdk_aac and output via RTP muxer. This eliminates the need for LOAS
-// parsing since ffmpeg handles RFC 3640 framing natively.
-func canEncodeELDViaRTP(bin string) bool {
+// libfdk_aac and output via RTP muxer. If withSBR is true, also tests
+// with -eld_sbr 1 since that's what will be used in production.
+func canEncodeELDViaRTP(bin string, withSBR bool) bool {
 	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		return false
@@ -72,34 +72,64 @@ func canEncodeELDViaRTP(bin string) bool {
 	defer listener.Close()
 	port := listener.LocalAddr().(*net.UDPAddr).Port
 
-	// Test WITHOUT -eld_sbr first (more compatible)
-	testCmd := exec.Command(bin,
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
-		"-ar", "16000", "-ac", "1",
+	}
+	if withSBR {
+		args = append(args, "-eld_sbr", "1")
+	}
+	args = append(args, "-ar", "16000", "-ac", "1",
 		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", port))
 
+	testCmd := exec.Command(bin, args...)
 	if err := testCmd.Run(); err == nil {
-		log.Printf("[backchannel] libfdk_aac ELD works with -f rtp")
+		log.Printf("[backchannel] libfdk_aac ELD works with -f rtp (sbr=%v)", withSBR)
 		return true
 	}
 
-	log.Printf("[backchannel] libfdk_aac ELD does NOT work with -f rtp")
+	log.Printf("[backchannel] libfdk_aac ELD does NOT work with -f rtp (sbr=%v)", withSBR)
 	return false
 }
 
 // supportsELDSBR tests if an ffmpeg binary supports -eld_sbr option.
+// Tests with multiple output formats because -eld_sbr may fail with some muxers.
 func supportsELDSBR(bin string) bool {
+	// Try with -f null first (most compatible test)
 	testCmd := exec.Command(bin,
 		"-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
 		"-ar", "16000", "-ac", "1",
+		"-f", "null", "-")
+	if testCmd.Run() == nil {
+		log.Printf("[backchannel] -eld_sbr support: true (null test)")
+		return true
+	}
+
+	// Try with -f latm (might fail if SBR+LATM has issues)
+	testCmd = exec.Command(bin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
+		"-ar", "16000", "-ac", "1",
 		"-f", "latm", os.DevNull)
-	supported := testCmd.Run() == nil
-	log.Printf("[backchannel] -eld_sbr support: %v", supported)
-	return supported
+	if testCmd.Run() == nil {
+		log.Printf("[backchannel] -eld_sbr support: true (latm test)")
+		return true
+	}
+
+	// Capture stderr for diagnostics
+	testCmd = exec.Command(bin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
+		"-ar", "16000", "-ac", "1",
+		"-f", "null", "-")
+	out, err := testCmd.CombinedOutput()
+	log.Printf("[backchannel] -eld_sbr support: false (err=%v output=%s)", err, string(out))
+	return false
 }
 
 func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backchannelPipeline, core.HandlerFunc, error) {
@@ -148,21 +178,26 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 
 	eldEncoder := findELDEncoder()
 	hasSBR := eldEncoder != "" && supportsELDSBR(eldEncoder)
+	log.Printf("[backchannel] encoder=%q hasSBR=%v", eldEncoder, hasSBR)
 	var started bool
 
 	// Mode 1: Try libfdk_aac with RTP output (best: no LOAS parsing needed)
-	if eldEncoder != "" && canEncodeELDViaRTP(eldEncoder) {
+	// Test with SBR first if available, fall back to RTP without SBR
+	rtpSBR := hasSBR && canEncodeELDViaRTP(eldEncoder, true)
+	rtpNoSBR := !rtpSBR && eldEncoder != "" && canEncodeELDViaRTP(eldEncoder, false)
+	if rtpSBR || rtpNoSBR {
+		useSBR := rtpSBR
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err == nil {
 			pipeline.udpConn = outputConn
 			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
-				outputConn.LocalAddr().(*net.UDPAddr).Port, hasSBR); err != nil {
+				outputConn.LocalAddr().(*net.UDPAddr).Port, useSBR); err != nil {
 				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
 				outputConn.Close()
 				pipeline.udpConn = nil
 			} else {
 				started = true
-				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP, no LOAS) ===")
+				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP, sbr=%v) ===", useSBR)
 			}
 		}
 	}
