@@ -105,7 +105,8 @@ func canEncodeELDViaRTP(bin string, extraArgs []string) bool {
 }
 
 // testELDOption tests if an ffmpeg binary supports a specific libfdk_aac option
-// by trying to encode a short sine wave with it.
+// by trying to encode a short sine wave with it. Uses -f latm output since
+// custom ffmpeg builds (like ffmpeg-homebridge) may not include the null muxer.
 func testELDOption(bin string, extraArgs ...string) bool {
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
@@ -113,7 +114,7 @@ func testELDOption(bin string, extraArgs ...string) bool {
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
 	args = append(args, extraArgs...)
-	args = append(args, "-ar", "16000", "-ac", "1", "-f", "null", "-")
+	args = append(args, "-ar", "16000", "-ac", "1", "-f", "latm", os.DevNull)
 
 	testCmd := exec.Command(bin, args...)
 	return testCmd.Run() == nil
