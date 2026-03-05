@@ -180,30 +180,12 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 
 	var started bool
 
-	// Mode 1: libfdk_aac with RTP output (cleanest: ffmpeg handles RFC 3640)
-	// -f rtp sets AVFMT_GLOBALHEADER → AACENC_TRANSMUX=TT_MP4_RAW.
-	if !started && eldEncoder != "" {
-		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err == nil {
-			pipeline.udpConn = outputConn
-			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
-				outputConn.LocalAddr().(*net.UDPAddr).Port); err != nil {
-				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
-				outputConn.Close()
-				pipeline.udpConn = nil
-			} else {
-				started = true
-				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP) ===")
-			}
-		}
-	}
-
-	// Mode 2: libfdk_aac with LATM pipe (-latm 1 required for ELD).
+	// Mode 1: libfdk_aac with LATM pipe (-latm 1 required for ELD).
 	// -latm 1 sets AACENC_TRANSMUX=TT_MP4_LOAS. Without it, the encoder
 	// defaults to ADTS which only supports AAC-LC.
 	// The -f latm muxer detects LOAS in the packets and passes through
-	// raw (NOT double-wrapping).
-	if !started && eldEncoder != "" {
+	// raw (NOT double-wrapping — confirmed from ffmpeg latmenc.c source).
+	if eldEncoder != "" {
 		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName); err != nil {
 			log.Printf("[backchannel] pipe mode failed: %v", err)
 		} else {
@@ -212,7 +194,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		}
 	}
 
-	// Mode 3: Fall back to RTP mode with native AAC encoder
+	// Mode 2: Fall back to RTP mode with native AAC encoder
 	if !started {
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
