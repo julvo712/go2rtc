@@ -61,10 +61,23 @@ func findELDEncoder() string {
 	return ""
 }
 
+// eldEncoderArgs returns extra ffmpeg args to match the camera's AudioSpecificConfig.
+// Camera expects: AAC-ELD, 16kHz, mono, 480-sample frames, LD-SBR.
+func eldEncoderArgs(hasSBR, hasFrameLength bool) []string {
+	var args []string
+	if hasFrameLength {
+		args = append(args, "-frame_length", "480")
+	}
+	if hasSBR {
+		args = append(args, "-eld_sbr", "1")
+	}
+	log.Printf("[backchannel] encoder extra args: %v", args)
+	return args
+}
+
 // canEncodeELDViaRTP tests if an ffmpeg binary can encode AAC-ELD with
-// libfdk_aac and output via RTP muxer. If withSBR is true, also tests
-// with -eld_sbr 1 since that's what will be used in production.
-func canEncodeELDViaRTP(bin string, withSBR bool) bool {
+// libfdk_aac and output via RTP muxer using the given extra encoder args.
+func canEncodeELDViaRTP(bin string, extraArgs []string) bool {
 	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		return false
@@ -77,59 +90,44 @@ func canEncodeELDViaRTP(bin string, withSBR bool) bool {
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
-	if withSBR {
-		args = append(args, "-eld_sbr", "1")
-	}
+	args = append(args, extraArgs...)
 	args = append(args, "-ar", "16000", "-ac", "1",
 		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", port))
 
 	testCmd := exec.Command(bin, args...)
 	if err := testCmd.Run(); err == nil {
-		log.Printf("[backchannel] libfdk_aac ELD works with -f rtp (sbr=%v)", withSBR)
+		log.Printf("[backchannel] libfdk_aac ELD+RTP test OK (args=%v)", extraArgs)
 		return true
 	}
 
-	log.Printf("[backchannel] libfdk_aac ELD does NOT work with -f rtp (sbr=%v)", withSBR)
+	log.Printf("[backchannel] libfdk_aac ELD+RTP test FAILED (args=%v)", extraArgs)
 	return false
 }
 
-// supportsELDSBR tests if an ffmpeg binary supports -eld_sbr option.
-// Tests with multiple output formats because -eld_sbr may fail with some muxers.
-func supportsELDSBR(bin string) bool {
-	// Try with -f null first (most compatible test)
-	testCmd := exec.Command(bin,
+// testELDOption tests if an ffmpeg binary supports a specific libfdk_aac option
+// by trying to encode a short sine wave with it.
+func testELDOption(bin string, extraArgs ...string) bool {
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
-		"-ar", "16000", "-ac", "1",
-		"-f", "null", "-")
-	if testCmd.Run() == nil {
-		log.Printf("[backchannel] -eld_sbr support: true (null test)")
-		return true
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
+	args = append(args, extraArgs...)
+	args = append(args, "-ar", "16000", "-ac", "1", "-f", "null", "-")
 
-	// Try with -f latm (might fail if SBR+LATM has issues)
-	testCmd = exec.Command(bin,
-		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
-		"-ar", "16000", "-ac", "1",
-		"-f", "latm", os.DevNull)
-	if testCmd.Run() == nil {
-		log.Printf("[backchannel] -eld_sbr support: true (latm test)")
-		return true
-	}
+	testCmd := exec.Command(bin, args...)
+	return testCmd.Run() == nil
+}
 
-	// Capture stderr for diagnostics
-	testCmd = exec.Command(bin,
-		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
-		"-ar", "16000", "-ac", "1",
-		"-f", "null", "-")
-	out, err := testCmd.CombinedOutput()
-	log.Printf("[backchannel] -eld_sbr support: false (err=%v output=%s)", err, string(out))
-	return false
+// probeELDCapabilities checks which libfdk_aac features the ffmpeg binary supports.
+func probeELDCapabilities(bin string) (hasSBR, hasFrameLength bool) {
+	hasSBR = testELDOption(bin, "-eld_sbr", "1")
+	log.Printf("[backchannel] probe: -eld_sbr 1 → %v", hasSBR)
+
+	hasFrameLength = testELDOption(bin, "-frame_length", "480")
+	log.Printf("[backchannel] probe: -frame_length 480 → %v", hasFrameLength)
+
+	return
 }
 
 func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backchannelPipeline, core.HandlerFunc, error) {
@@ -177,34 +175,37 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	}
 
 	eldEncoder := findELDEncoder()
-	hasSBR := eldEncoder != "" && supportsELDSBR(eldEncoder)
-	log.Printf("[backchannel] encoder=%q hasSBR=%v", eldEncoder, hasSBR)
+	var hasSBR, hasFrameLength bool
+	if eldEncoder != "" {
+		hasSBR, hasFrameLength = probeELDCapabilities(eldEncoder)
+	}
+	log.Printf("[backchannel] encoder=%q hasSBR=%v hasFrameLength=%v", eldEncoder, hasSBR, hasFrameLength)
+
+	// Build encoder args that match the camera's AudioSpecificConfig:
+	// AAC-ELD, 16kHz, mono, 480-sample frames, LD-SBR
+	encoderArgs := eldEncoderArgs(hasSBR, hasFrameLength)
 	var started bool
 
 	// Mode 1: Try libfdk_aac with RTP output (best: no LOAS parsing needed)
-	// Test with SBR first if available, fall back to RTP without SBR
-	rtpSBR := hasSBR && canEncodeELDViaRTP(eldEncoder, true)
-	rtpNoSBR := !rtpSBR && eldEncoder != "" && canEncodeELDViaRTP(eldEncoder, false)
-	if rtpSBR || rtpNoSBR {
-		useSBR := rtpSBR
+	if eldEncoder != "" && canEncodeELDViaRTP(eldEncoder, encoderArgs) {
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err == nil {
 			pipeline.udpConn = outputConn
 			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
-				outputConn.LocalAddr().(*net.UDPAddr).Port, useSBR); err != nil {
+				outputConn.LocalAddr().(*net.UDPAddr).Port, encoderArgs); err != nil {
 				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
 				outputConn.Close()
 				pipeline.udpConn = nil
 			} else {
 				started = true
-				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP, sbr=%v) ===", useSBR)
+				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP) ===")
 			}
 		}
 	}
 
 	// Mode 2: Try libfdk_aac with LATM pipe (needs LOAS parsing)
 	if !started && eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, hasSBR); err != nil {
+		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, encoderArgs); err != nil {
 			log.Printf("[backchannel] pipe mode failed: %v", err)
 		} else {
 			started = true
@@ -285,16 +286,14 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 // startRTPModeFDK launches ffmpeg with libfdk_aac, outputting RFC 3640 RTP
 // directly to a UDP port. This is the preferred mode because it avoids LOAS
 // parsing entirely — ffmpeg handles the AAC → RTP framing natively.
-func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile string, outputPort int, hasSBR bool) error {
+func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile string, outputPort int, extraArgs []string) error {
 	args := []string{
 		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
-	if hasSBR {
-		args = append(args, "-eld_sbr", "1")
-	}
+	args = append(args, extraArgs...)
 	args = append(args,
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
@@ -336,16 +335,14 @@ func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile 
 
 // startPipeMode launches ffmpeg with libfdk_aac, outputting LATM to stdout.
 // We parse LOAS frames from stdout and send raw AAC-ELD frames via SRTP.
-func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string, hasSBR bool) error {
+func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string, extraArgs []string) error {
 	args := []string{
 		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
-	if hasSBR {
-		args = append(args, "-eld_sbr", "1")
-	}
+	args = append(args, extraArgs...)
 	args = append(args, "-latm", "1",
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "latm", "pipe:1")
