@@ -337,7 +337,7 @@ func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile st
 		args = append(args, "-eld_sbr", "1")
 	}
 	args = append(args,
-		"-ar", "16000", "-ac", "1", "-b:a", "32k",
+		"-ar", "16000", "-ac", "1", "-b:a", "24k",
 		"-f", "latm", "pipe:1")
 
 	cmd := exec.CommandContext(ctx, bin, args...)
