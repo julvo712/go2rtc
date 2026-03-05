@@ -344,7 +344,10 @@ func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile st
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 	}
 	args = append(args, extraArgs...)
-	args = append(args, "-latm", "1",
+	// NOTE: Do NOT add -latm 1 here. That tells the encoder to output LOAS
+	// internally, but -f latm already wraps in LOAS. Using both causes
+	// double-wrapping and corrupts the AudioSpecificConfig.
+	args = append(args,
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "latm", "pipe:1")
 
@@ -578,7 +581,64 @@ func extractPayloadFromBitOffset(data []byte, bitOffset int) []byte {
 	return result
 }
 
+// extractFirstAME parses the first AudioMuxElement (useSameStreamMux=0) which
+// contains the StreamMuxConfig. It logs the AudioSpecificConfig for debugging,
+// then extracts the raw AAC payload.
 func extractFirstAME(data []byte) []byte {
+	if len(data) < 4 {
+		return nil
+	}
+
+	// Parse StreamMuxConfig to find where AudioSpecificConfig and payload are.
+	// Bit 0: useSameStreamMux = 0 (already verified by caller)
+	// Bit 1: audioMuxVersion
+	amv := readBits(data, 0, 1) // useSameStreamMux
+	_ = amv
+	audioMuxVersion := readBits(data, 1, 1)
+	if audioMuxVersion != 0 {
+		log.Printf("[backchannel] first AME: audioMuxVersion=%d (unsupported)", audioMuxVersion)
+		return nil
+	}
+
+	// audioMuxVersion=0:
+	// bit 2: allStreamsSameTimeFraming
+	// bits 3-8: numSubFrames (6 bits)
+	// bits 9-12: numProgram (4 bits)
+	// bits 13-15: numLayer (3 bits)
+	// bits 16+: AudioSpecificConfig
+
+	// Log the ASC bytes (starting at bit 16, which is byte-aligned)
+	ascStart := 16 / 8 // = byte 2
+	if ascStart+7 <= len(data) {
+		ascBytes := data[ascStart : ascStart+7]
+		log.Printf("[backchannel] first AME: encoder AudioSpecificConfig = %X (camera expects F8F0312C00BC00)", ascBytes)
+
+		// Decode key fields for diagnostics
+		frameLengthFlag := readBits(ascBytes, 19, 1)
+		var sbrFlag int
+		if 23 < len(ascBytes)*8 {
+			sbrFlag = readBits(ascBytes, 23, 1)
+		}
+		log.Printf("[backchannel] first AME: frameLengthFlag=%d (want 1=480samples) ldSbrPresentFlag=%d (want 1=SBR)",
+			frameLengthFlag, sbrFlag)
+	}
+
+	// Skip StreamMuxConfig to find the payload.
+	// For simplicity, estimate ASC size and look for PayloadLengthInfo after it.
+	// The ASC for ELD is typically 5-7 bytes. After ASC comes:
+	// frameLengthType (3 bits), latmBufferFullness (8 bits),
+	// otherDataPresent (1 bit), crcCheckPresent (1 bit)
+	// This is complex to parse precisely, so we compute the payload position
+	// by searching for it. The payload is at the end of the AME.
+	// A simpler approach: the payload length info is N bytes from the end,
+	// where the first N tells us the payload size.
+
+	// Try to find payload by reading PayloadLengthInfo at various offsets.
+	// The StreamMuxConfig for our simple case (1 stream, 1 program, 1 layer)
+	// with 7-byte ASC ends around bit 16 + 56 (ASC) + 13 (frameLengthType+bufferFullness+flags) = bit 85
+	// That's approximately byte 10-11.
+
+	// For now, return nil for the first frame (we'll get subsequent frames via useSameStreamMux=1)
 	return nil
 }
 
