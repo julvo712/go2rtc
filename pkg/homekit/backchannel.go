@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/srtp"
@@ -20,12 +21,12 @@ import (
 // incoming Opus RTP packets (from WebRTC) to AAC-ELD RTP packets, which are
 // then sent to the HomeKit camera via SRTP.
 //
-// Two modes:
-//   - Pipe mode (libfdk_aac): encoder outputs LATM to stdout, Go parses LOAS
-//     frames and extracts raw AAC-ELD frames for SRTP. This bypasses libfdk_aac's
-//     inability to encode ELD with RAW transport (which -f rtp requires).
-//   - RTP mode (native AAC): encoder outputs RTP directly to UDP.
-//     Produces 1024-sample frames (vs 480 expected), split in readAndSend.
+// Three modes (tried in order):
+//  1. RTP mode with libfdk_aac: encoder outputs RFC 3640 RTP directly to UDP.
+//     No LOAS parsing needed — ffmpeg handles all framing.
+//  2. Pipe mode (libfdk_aac): encoder outputs LATM to stdout, Go parses LOAS
+//     frames and extracts raw AAC-ELD frames for SRTP.
+//  3. RTP mode (native AAC): fallback encoder outputs RTP directly to UDP.
 type backchannelPipeline struct {
 	cmd      *exec.Cmd
 	cancel   context.CancelFunc
@@ -38,7 +39,7 @@ type backchannelPipeline struct {
 }
 
 // findELDEncoder searches for an ffmpeg binary that can encode AAC-ELD
-// using libfdk_aac with LATM output (LOAS transport supports ELD).
+// using libfdk_aac.
 func findELDEncoder() string {
 	for _, bin := range []string{
 		"/usr/local/bin/ffmpeg-homebridge",
@@ -49,14 +50,56 @@ func findELDEncoder() string {
 		testCmd := exec.Command(bin,
 			"-hide_banner", "-loglevel", "error",
 			"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-			"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-latm", "1",
+			"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 			"-ar", "16000", "-ac", "1",
 			"-f", "latm", os.DevNull)
 		if err := testCmd.Run(); err == nil {
+			log.Printf("[backchannel] found ELD encoder: %s", bin)
 			return bin
 		}
 	}
 	return ""
+}
+
+// canEncodeELDViaRTP tests if an ffmpeg binary can encode AAC-ELD with
+// libfdk_aac and output via RTP muxer. This eliminates the need for LOAS
+// parsing since ffmpeg handles RFC 3640 framing natively.
+func canEncodeELDViaRTP(bin string) bool {
+	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return false
+	}
+	defer listener.Close()
+	port := listener.LocalAddr().(*net.UDPAddr).Port
+
+	// Test WITHOUT -eld_sbr first (more compatible)
+	testCmd := exec.Command(bin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
+		"-ar", "16000", "-ac", "1",
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", port))
+
+	if err := testCmd.Run(); err == nil {
+		log.Printf("[backchannel] libfdk_aac ELD works with -f rtp")
+		return true
+	}
+
+	log.Printf("[backchannel] libfdk_aac ELD does NOT work with -f rtp")
+	return false
+}
+
+// supportsELDSBR tests if an ffmpeg binary supports -eld_sbr option.
+func supportsELDSBR(bin string) bool {
+	testCmd := exec.Command(bin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-eld_sbr", "1",
+		"-ar", "16000", "-ac", "1",
+		"-f", "latm", os.DevNull)
+	supported := testCmd.Run() == nil
+	log.Printf("[backchannel] -eld_sbr support: %v", supported)
+	return supported
 }
 
 func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backchannelPipeline, core.HandlerFunc, error) {
@@ -103,18 +146,39 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		cancel:  cancel,
 	}
 
-	// Try pipe mode with libfdk_aac (proper 480-sample AAC-ELD frames)
 	eldEncoder := findELDEncoder()
-	if eldEncoder != "" {
-		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName); err != nil {
-			log.Printf("[backchannel] pipe mode failed: %v, falling back to native", err)
-			eldEncoder = ""
+	hasSBR := eldEncoder != "" && supportsELDSBR(eldEncoder)
+	var started bool
+
+	// Mode 1: Try libfdk_aac with RTP output (best: no LOAS parsing needed)
+	if eldEncoder != "" && canEncodeELDViaRTP(eldEncoder) {
+		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err == nil {
+			pipeline.udpConn = outputConn
+			if err := pipeline.startRTPModeFDK(ctx, eldEncoder, sdpFileName,
+				outputConn.LocalAddr().(*net.UDPAddr).Port, hasSBR); err != nil {
+				log.Printf("[backchannel] RTP-FDK mode failed: %v", err)
+				outputConn.Close()
+				pipeline.udpConn = nil
+			} else {
+				started = true
+				log.Printf("[backchannel] === ACTIVE MODE: RTP-FDK (libfdk_aac → RTP, no LOAS) ===")
+			}
 		}
 	}
 
-	// Fall back to RTP mode with native AAC encoder
-	if eldEncoder == "" {
-		// Open UDP port for RTP output
+	// Mode 2: Try libfdk_aac with LATM pipe (needs LOAS parsing)
+	if !started && eldEncoder != "" {
+		if err := pipeline.startPipeMode(ctx, eldEncoder, sdpFileName, hasSBR); err != nil {
+			log.Printf("[backchannel] pipe mode failed: %v", err)
+		} else {
+			started = true
+			log.Printf("[backchannel] === ACTIVE MODE: LOAS pipe (libfdk_aac → LATM → LOAS parse) ===")
+		}
+	}
+
+	// Mode 3: Fall back to RTP mode with native AAC encoder
+	if !started {
 		outputConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			cancel()
@@ -127,6 +191,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 			pipeline.Close()
 			return nil, nil, fmt.Errorf("backchannel: start ffmpeg: %w", err)
 		}
+		log.Printf("[backchannel] === ACTIVE MODE: native AAC (1024-sample frames) ===")
 	}
 
 	// Start goroutine to read AAC-ELD output and send to camera
@@ -182,18 +247,76 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 	return pipeline, handler, nil
 }
 
-// startPipeMode launches ffmpeg with libfdk_aac, outputting LATM to stdout.
-// We parse LOAS frames from stdout and send raw AAC-ELD frames via SRTP.
-func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string) error {
-	log.Printf("[backchannel] using pipe mode: %s (libfdk_aac → LATM stdout → LOAS parse)", bin)
-
-	cmd := exec.CommandContext(ctx, bin,
-		"-hide_banner", "-loglevel", "error",
+// startRTPModeFDK launches ffmpeg with libfdk_aac, outputting RFC 3640 RTP
+// directly to a UDP port. This is the preferred mode because it avoids LOAS
+// parsing entirely — ffmpeg handles the AAC → RTP framing natively.
+func (p *backchannelPipeline) startRTPModeFDK(ctx context.Context, bin, sdpFile string, outputPort int, hasSBR bool) error {
+	args := []string{
+		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
-		"-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-latm", "1",
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
+	}
+	if hasSBR {
+		args = append(args, "-eld_sbr", "1")
+	}
+	args = append(args,
+		"-ar", "16000", "-ac", "1", "-b:a", "32k",
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	log.Printf("[backchannel] RTP-FDK cmd: %s", cmd.String())
+
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+
+	p.cmd = cmd
+
+	go drainStderr("rtp-fdk", stderr)
+
+	// Wait briefly to check if ffmpeg exits immediately (encoder error)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		return fmt.Errorf("ffmpeg exited immediately: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		// Still running, good
+		go func() {
+			err := <-done
+			if err != nil {
+				log.Printf("[backchannel] RTP-FDK process exited: %v", err)
+			} else {
+				log.Printf("[backchannel] RTP-FDK process exited cleanly")
+			}
+		}()
+	}
+
+	return nil
+}
+
+// startPipeMode launches ffmpeg with libfdk_aac, outputting LATM to stdout.
+// We parse LOAS frames from stdout and send raw AAC-ELD frames via SRTP.
+func (p *backchannelPipeline) startPipeMode(ctx context.Context, bin, sdpFile string, hasSBR bool) error {
+	args := []string{
+		"-hide_banner", "-loglevel", "info",
+		"-protocol_whitelist", "file,rtp,udp",
+		"-f", "sdp", "-i", sdpFile,
+		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
+	}
+	if hasSBR {
+		args = append(args, "-eld_sbr", "1")
+	}
+	args = append(args, "-latm", "1",
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "latm", "pipe:1")
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	log.Printf("[backchannel] pipe cmd: %s", cmd.String())
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -223,12 +346,14 @@ func (p *backchannelPipeline) startRTPMode(ctx context.Context, sdpFile string, 
 	log.Printf("[backchannel] WARNING: using native AAC encoder (1024-sample frames)")
 
 	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner", "-loglevel", "error",
+		"-hide_banner", "-loglevel", "info",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "aac", "-profile:a", "aac_eld",
 		"-ar", "16000", "-ac", "1", "-b:a", "32k",
 		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", outputPort))
+
+	log.Printf("[backchannel] native cmd: %s", cmd.String())
 
 	stderr, _ := cmd.StderrPipe()
 
@@ -238,10 +363,10 @@ func (p *backchannelPipeline) startRTPMode(ctx context.Context, sdpFile string, 
 
 	p.cmd = cmd
 
-	go drainStderr("ffmpeg", stderr)
+	go drainStderr("native", stderr)
 	go func() {
 		cmd.Wait()
-		log.Printf("[backchannel] ffmpeg process exited")
+		log.Printf("[backchannel] native process exited")
 	}()
 
 	return nil
@@ -259,18 +384,6 @@ func drainStderr(name string, stderr interface{ Read([]byte) (int, error) }) {
 
 // readLOASAndSend reads LOAS frames from the encoder's stdout, extracts
 // raw AAC-ELD frames, wraps them in RFC 3640, and sends via SRTP.
-//
-// LOAS frame format:
-//
-//	sync: 11 bits = 0x2B7 (byte0=0x56, byte1 top 3 bits = 0xE0)
-//	frame_length: 13 bits
-//	AudioMuxElement: frame_length bytes
-//
-// AudioMuxElement (after first frame, useSameStreamMux=1):
-//
-//	bit 0: useSameStreamMux = 1
-//	PayloadLengthInfo: sum bytes until byte < 255
-//	PayloadMux: raw AAC frame
 func (p *backchannelPipeline) readLOASAndSend(session *srtp.Session, sendCounter *int) {
 	r := bufio.NewReaderSize(p.stdout, 4096)
 
@@ -331,14 +444,24 @@ func (p *backchannelPipeline) readLOASAndSend(session *srtp.Session, sendCounter
 
 		if aacFrame == nil {
 			if totalFrames <= 3 {
-				log.Printf("[backchannel] LOAS: failed to extract AAC frame, ameLen=%d", frameLen)
+				hexDump := fmt.Sprintf("%x", ameBuf)
+				if len(hexDump) > 60 {
+					hexDump = hexDump[:60] + "..."
+				}
+				log.Printf("[backchannel] LOAS: failed to extract AAC frame, ameLen=%d hex=%s",
+					frameLen, hexDump)
 			}
 			continue
 		}
 
 		totalFrames++
 		if totalFrames <= 5 {
-			log.Printf("[backchannel] LOAS frame #%d: aacLen=%d ameLen=%d", totalFrames, len(aacFrame), frameLen)
+			hexDump := fmt.Sprintf("%x", aacFrame)
+			if len(hexDump) > 40 {
+				hexDump = hexDump[:40] + "..."
+			}
+			log.Printf("[backchannel] LOAS frame #%d: aacLen=%d ameLen=%d aacHex=%s",
+				totalFrames, len(aacFrame), frameLen, hexDump)
 		}
 
 		// Wrap in RFC 3640 format (single AU) and send via SRTP
@@ -370,13 +493,6 @@ func (p *backchannelPipeline) readLOASAndSend(session *srtp.Session, sendCounter
 }
 
 // extractAACFromAME extracts the raw AAC frame from an AudioMuxElement.
-//
-// For the first frame (useSameStreamMux=0), we need to skip the
-// StreamMuxConfig before reading the payload. For subsequent frames
-// (useSameStreamMux=1), we skip 1 bit then read PayloadLengthInfo.
-//
-// Since bit-level parsing of StreamMuxConfig is complex, for the first
-// frame we use a heuristic: scan for the payload length prefix pattern.
 func extractAACFromAME(data []byte, isFirst bool) []byte {
 	if len(data) == 0 {
 		return nil
@@ -385,37 +501,8 @@ func extractAACFromAME(data []byte, isFirst bool) []byte {
 	if !isFirst {
 		// useSameStreamMux should be 1 (bit 0 of first byte)
 		if data[0]&0x80 == 0 {
-			// useSameStreamMux=0 unexpectedly, treat as first frame
 			return extractFirstAME(data)
 		}
-
-		// After useSameStreamMux=1 bit, PayloadLengthInfo starts.
-		// PayloadLengthInfo is byte-aligned after the 1-bit flag? No —
-		// it's at bit position 1. For a single-program, single-layer,
-		// allStreamsSameTimeFraming config, PayloadLengthInfo is at bit 1.
-		//
-		// Read length bytes starting at bit offset 1:
-		// Since the first bit is 1, the remaining 7 bits of byte 0
-		// plus subsequent bytes encode PayloadLengthInfo.
-		//
-		// Actually, for LATM with allStreamsSameTimeFraming=1,
-		// frameLengthType=0 (variable), the PayloadLengthInfo is:
-		//   while (tmp = readBits(8)) == 255: length += 255
-		//   length += tmp
-		//
-		// But these reads start at bit offset 1, not byte-aligned.
-		// For simplicity, since we know the total frame size,
-		// we can work backwards from the end.
-		//
-		// Better approach: the raw AAC frame is at the end of the AME,
-		// and its length = total_length - overhead. For useSameStreamMux=1
-		// with a single stream, overhead is just the 1-bit flag plus
-		// the length prefix bytes.
-		//
-		// Given the complexity of bit-level parsing, use a simpler approach:
-		// The AAC frame occupies most of the AME. The overhead is typically
-		// 2-3 bytes (1 bit + length prefix). Try reading length from bit offset 1.
-
 		return extractPayloadFromBitOffset(data, 1)
 	}
 
@@ -425,8 +512,6 @@ func extractAACFromAME(data []byte, isFirst bool) []byte {
 // extractPayloadFromBitOffset reads PayloadLengthInfo starting at the given
 // bit offset in data, then returns the AAC payload bytes.
 func extractPayloadFromBitOffset(data []byte, bitOffset int) []byte {
-	// Read PayloadLengthInfo: byte-level length encoding at bit offset
-	// Each "byte" is 8 bits read from the bitstream
 	payloadLen := 0
 	for {
 		if bitOffset+8 > len(data)*8 {
@@ -440,20 +525,16 @@ func extractPayloadFromBitOffset(data []byte, bitOffset int) []byte {
 		}
 	}
 
-	// Remaining bits should contain the payload
-	// Payload starts at current bit offset
 	byteOffset := bitOffset / 8
 	bitRemainder := bitOffset % 8
 
 	if bitRemainder == 0 {
-		// Byte-aligned — direct slice
 		if byteOffset+payloadLen > len(data) {
 			return nil
 		}
 		return data[byteOffset : byteOffset+payloadLen]
 	}
 
-	// Not byte-aligned — need to shift bits
 	if byteOffset+payloadLen+1 > len(data) {
 		return nil
 	}
@@ -464,18 +545,10 @@ func extractPayloadFromBitOffset(data []byte, bitOffset int) []byte {
 	return result
 }
 
-// extractFirstAME handles the first AudioMuxElement where useSameStreamMux=0
-// and StreamMuxConfig is present. Since parsing StreamMuxConfig is complex,
-// we use a pragmatic approach: the AAC payload is at the end, and we can
-// estimate its position from the total size.
 func extractFirstAME(data []byte) []byte {
-	// For the first frame, skip it and wait for subsequent frames
-	// where useSameStreamMux=1 and parsing is simpler.
-	// The first frame's audio quality loss is negligible.
 	return nil
 }
 
-// readBits reads n bits from data starting at bitOffset (MSB first).
 func readBits(data []byte, bitOffset, n int) int {
 	val := 0
 	for i := 0; i < n; i++ {
@@ -489,7 +562,7 @@ func readBits(data []byte, bitOffset, n int) int {
 }
 
 // readRTPAndSend reads AAC-ELD RTP packets from ffmpeg's output UDP port
-// (native encoder mode) and forwards to the camera via SRTP.
+// and forwards to the camera via SRTP.
 func (p *backchannelPipeline) readRTPAndSend(session *srtp.Session, sendCounter *int) {
 	buf := make([]byte, 2048)
 
@@ -537,8 +610,13 @@ func (p *backchannelPipeline) readRTPAndSend(session *srtp.Session, sendCounter 
 		data := payload[2+auHeadersLen:]
 
 		if totalRead <= 5 {
-			log.Printf("[backchannel] RTP packet #%d: PT=%d frames=%d dataLen=%d",
-				totalRead, packet.PayloadType, numFrames, len(data))
+			hexDump := fmt.Sprintf("%x", payload)
+			if len(hexDump) > 80 {
+				hexDump = hexDump[:80] + "..."
+			}
+			log.Printf("[backchannel] ffmpeg RTP #%d: PT=%d SSRC=%d seq=%d ts=%d frames=%d dataLen=%d hex=%s",
+				totalRead, packet.PayloadType, packet.SSRC, packet.SequenceNumber,
+				packet.Timestamp, numFrames, len(data), hexDump)
 		}
 
 		for i := 0; i < numFrames && len(headers) >= 2; i++ {
@@ -573,13 +651,8 @@ func (p *backchannelPipeline) readRTPAndSend(session *srtp.Session, sendCounter 
 
 			if sent, err := session.WriteRTP(singlePacket); err == nil {
 				*sendCounter += sent
-				if totalRead <= 3 {
-					log.Printf("[backchannel] RTP sent frame %d/%d: auSize=%d sent=%d seq=%d ts=%d remote=%v",
-						i+1, numFrames, auSize, sent, seq-1, timestamp-timestampIncrement,
-						session.Remote != nil)
-				}
 			} else if totalRead <= 3 {
-				log.Printf("[backchannel] RTP send ERROR: %v remote=%v", err, session.Remote)
+				log.Printf("[backchannel] send ERROR: %v", err)
 			}
 		}
 	}

@@ -94,6 +94,7 @@ func (c *Client) GetMedias() []*core.Media {
 	}
 
 	c.SDP = fmt.Sprintf("%+v\n%+v", c.videoConfig, c.audioConfig)
+	log.Printf("[homekit] camera audio config: %+v", c.audioConfig)
 
 	// Recvonly audio: camera's native codecs (ELD) plus Opus for transcoded output.
 	// If a consumer only speaks Opus (e.g. WebRTC), we transcode ELD→Opus in Start().
@@ -301,6 +302,9 @@ func (c *Client) Start() error {
 	}
 
 	// Set up audio handler (with ELD→Opus transcoding if needed)
+	// Also set up echo diagnostic: when camera sends non-silence audio,
+	// echo the raw AAC frames back to test SRTP transport independently.
+	var echoCount int
 	if audioTrack != nil {
 		needsDeadline := videoTrack == nil
 		needsTranscoding := audioTrack.Codec.Name == core.CodecOpus
@@ -312,12 +316,31 @@ func (c *Client) Start() error {
 				log.Printf("[homekit] forward audio failed: %v", err)
 			} else {
 				c.forwardAudio = fwd
+				audioSession := c.audioSession // capture for closure
 				c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
 					if needsDeadline {
 						deadline.Reset(core.ConnDeadline)
 					}
 					fwd.WriteELDPacket(packet)
 					c.Recv += len(packet.Payload)
+
+					// Echo diagnostic: send camera's own audio back
+					// Only echo non-silence frames (payload > 10 bytes)
+					if len(packet.Payload) > 10 && echoCount < 50 {
+						echoCount++
+						if echoCount <= 5 {
+							log.Printf("[homekit] ECHO #%d: sending camera's own AAC frame back (payloadLen=%d PT=%d)",
+								echoCount, len(packet.Payload), packet.PayloadType)
+						}
+						echoPacket := &rtp.Packet{
+							Header: rtp.Header{
+								Version: 2,
+								Marker:  true,
+							},
+							Payload: packet.Payload,
+						}
+						audioSession.WriteRTP(echoPacket)
+					}
 				}
 			}
 		} else {
