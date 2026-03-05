@@ -94,7 +94,6 @@ func (c *Client) GetMedias() []*core.Media {
 	}
 
 	c.SDP = fmt.Sprintf("%+v\n%+v", c.videoConfig, c.audioConfig)
-	log.Printf("[homekit] camera audio config: %+v", c.audioConfig)
 
 	// Recvonly audio: camera's native codecs (ELD) plus Opus for transcoded output.
 	// If a consumer only speaks Opus (e.g. WebRTC), we transcode ELD→Opus in Start().
@@ -205,10 +204,7 @@ func (c *Client) unmuteSpeaker() {
 // startBackchannel wires up the backchannel audio pipeline after the SRTP
 // session has been established. Must be called from Start().
 func (c *Client) startBackchannel() error {
-	// Unmute the camera speaker before starting backchannel audio
-	log.Printf("[homekit] startBackchannel: unmuting speaker...")
 	c.unmuteSpeaker()
-	log.Printf("[homekit] startBackchannel: setting up pipeline...")
 
 	codec := c.backchannelCodec
 	track := c.backchannelTrack
@@ -307,7 +303,6 @@ func (c *Client) Start() error {
 		needsTranscoding := audioTrack.Codec.Name == core.CodecOpus
 
 		if needsTranscoding {
-			log.Printf("[homekit] audio track is Opus, setting up ELD→Opus transcoding")
 			fwd, err := startForwardAudioPipeline(audioTrack, &c.Recv)
 			if err != nil {
 				log.Printf("[homekit] forward audio failed: %v", err)

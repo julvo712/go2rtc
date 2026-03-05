@@ -24,7 +24,6 @@ type forwardAudioPipeline struct {
 	sdpFile  string
 	mu       sync.Mutex
 	closed   bool
-	pktCount int
 }
 
 // startForwardAudioPipeline sets up an ffmpeg process that decodes AAC-ELD RTP
@@ -45,10 +44,7 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	}
 	opusPort := opusListener.LocalAddr().(*net.UDPAddr).Port
 
-	// AudioSpecificConfig for AAC-ELD 16kHz mono with LD-SBR.
-	// Based on homebridge config F8F0212C00BC00 but with frameLengthFlag=1
-	// (480 samples) instead of 0 (512 samples), matching the camera's actual
-	// frame size visible from RTP timestamp increments of 480.
+	// AudioSpecificConfig for AAC-ELD 16kHz mono with LD-SBR, 480-sample frames.
 	configHex := "F8F0312C00BC00"
 
 	sdp := fmt.Sprintf(
@@ -73,31 +69,25 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	sdpFile.WriteString(sdp)
 	sdpFile.Close()
 
-	log.Printf("[forward-audio] ELD config hex: %s", configHex)
-	log.Printf("[forward-audio] SDP:\n%s", sdp)
-
 	// Close the ELD listener so ffmpeg can bind to the same port
 	eldListener.Close()
 
-	// Use ffmpeg-homebridge (libfdk_aac) for decoding — the native AAC decoder
+	// Use ffmpeg with libfdk_aac for decoding — the native AAC decoder
 	// doesn't support Low Delay SBR which HomeKit cameras use.
 	ffmpegBin := findELDEncoder()
 	if ffmpegBin == "" {
-		ffmpegBin = "ffmpeg" // fallback
+		ffmpegBin = "ffmpeg"
 	}
-	log.Printf("[forward-audio] using decoder: %s", ffmpegBin)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cmd := exec.CommandContext(ctx, ffmpegBin,
-		"-hide_banner", "-loglevel", "info",
-		"-c:a", "libfdk_aac", // input decoder: supports LD-SBR
+		"-hide_banner", "-loglevel", "error",
+		"-c:a", "libfdk_aac",
 		"-protocol_whitelist", "file,rtp,udp",
 		"-f", "sdp", "-i", sdpFileName,
 		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
 		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", opusPort))
-
-	log.Printf("[forward-audio] cmd: %s", cmd.String())
 
 	stderr, _ := cmd.StderrPipe()
 
@@ -108,7 +98,7 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 		return nil, fmt.Errorf("forward: start ffmpeg: %w", err)
 	}
 
-	go drainStderr("forward", stderr)
+	go drainStderr("forward-audio", stderr)
 
 	pipeline := &forwardAudioPipeline{
 		cmd:      cmd,
@@ -139,21 +129,6 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 
 // WriteELDPacket forwards a decrypted ELD RTP packet from the camera to ffmpeg.
 func (p *forwardAudioPipeline) WriteELDPacket(packet *rtp.Packet) {
-	p.mu.Lock()
-	p.pktCount++
-	n := p.pktCount
-	p.mu.Unlock()
-
-	if n <= 5 {
-		hexDump := fmt.Sprintf("%x", packet.Payload)
-		if len(hexDump) > 64 {
-			hexDump = hexDump[:64] + "..."
-		}
-		log.Printf("[forward-audio] camera RTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d first=%s",
-			n, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Timestamp,
-			len(packet.Payload), hexDump)
-	}
-
 	b, err := packet.Marshal()
 	if err != nil {
 		return
@@ -164,7 +139,6 @@ func (p *forwardAudioPipeline) WriteELDPacket(packet *rtp.Packet) {
 // readOpusAndForward reads Opus RTP packets from ffmpeg output and writes to track.
 func (p *forwardAudioPipeline) readOpusAndForward(track *core.Receiver, recvCounter *int) {
 	buf := make([]byte, 2048)
-	var totalRead int
 
 	for {
 		n, _, err := p.opusConn.ReadFrom(buf)
@@ -178,16 +152,9 @@ func (p *forwardAudioPipeline) readOpusAndForward(track *core.Receiver, recvCoun
 			return
 		}
 
-		totalRead++
-
 		packet := &rtp.Packet{}
 		if err := packet.Unmarshal(buf[:n]); err != nil {
 			continue
-		}
-
-		if totalRead <= 5 {
-			log.Printf("[forward-audio] Opus packet #%d: PT=%d len=%d ts=%d",
-				totalRead, packet.PayloadType, len(packet.Payload), packet.Timestamp)
 		}
 
 		track.WriteRTP(packet)

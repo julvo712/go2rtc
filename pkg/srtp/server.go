@@ -2,7 +2,6 @@ package srtp
 
 import (
 	"encoding/binary"
-	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -75,9 +74,8 @@ func (s *Server) GetSession(ssrc uint32) (session *Session) {
 
 func (s *Server) handle() error {
 	b := make([]byte, 2048)
-	var videoReadCount, audioReadCount int
 	for {
-		n, addr, err := s.conn.ReadFrom(b)
+		n, _, err := s.conn.ReadFrom(b)
 		if err != nil {
 			return err
 		}
@@ -85,25 +83,11 @@ func (s *Server) handle() error {
 		// Multiplexing RTP Data and Control Packets on a Single Port
 		// https://datatracker.ietf.org/doc/html/rfc5761
 
-		switch packetType := b[1]; packetType {
+		switch b[1] {
 		case 99, 110, 0x80 | 99, 0x80 | 110:
 			// this is default position for SSRC in RTP packet
 			ssrc := binary.BigEndian.Uint32(b[8:])
 			if session := s.GetSession(ssrc); session != nil {
-				pt := packetType & 0x7F
-				if pt == 110 {
-					audioReadCount++
-					if audioReadCount <= 3 {
-						log.Printf("[srtp] ReadRTP audio #%d: SSRC=%d from=%s remoteAddr=%s len=%d",
-							audioReadCount, ssrc, addr, session.Remote.addr, n)
-					}
-				} else {
-					videoReadCount++
-					if videoReadCount <= 3 {
-						log.Printf("[srtp] ReadRTP video #%d: SSRC=%d from=%s remoteAddr=%s len=%d",
-							videoReadCount, ssrc, addr, session.Remote.addr, n)
-					}
-				}
 				session.ReadRTP(b[:n])
 			}
 

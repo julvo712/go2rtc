@@ -1,8 +1,6 @@
 package srtp
 
 import (
-	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -28,7 +26,6 @@ type Session struct {
 
 	senderRTCP rtcp.SenderReport
 	senderTime time.Time
-	writeCount int
 	writeMu    sync.Mutex
 }
 
@@ -112,18 +109,7 @@ func (s *Session) WriteRTP(packet *rtp.Packet) (int, error) {
 		return 0, err
 	}
 
-	n, err := s.conn.WriteTo(b, s.Remote.addr)
-	s.writeCount++
-	if s.writeCount <= 5 {
-		hexDump := fmt.Sprintf("%x", clone.Payload)
-		if len(hexDump) > 80 {
-			hexDump = hexDump[:80] + "..."
-		}
-		log.Printf("[srtp] WriteRTP #%d: PT=%d SSRC=%d seq=%d ts=%d payloadLen=%d → dest=%s written=%d err=%v hex=%s",
-			s.writeCount, clone.PayloadType, clone.SSRC, clone.SequenceNumber, clone.Timestamp,
-			len(clone.Payload), s.Remote.addr, n, err, hexDump)
-	}
-	return n, err
+	return s.conn.WriteTo(b, s.Remote.addr)
 }
 
 // writeRTCP sends RTCP — caller must hold writeMu.
