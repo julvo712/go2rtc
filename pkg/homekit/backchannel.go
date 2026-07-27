@@ -40,6 +40,7 @@ type backchannelPipeline struct {
 	session   *srtp.Session
 	sendCounter *int
 	tsIncrement uint32 // samples per frame, derived from codec clock rate
+	restartCount int   // increments on crash, resets on successful frame
 }
 
 // cachedELDEncoder is the result of findELDEncoder(), cached after first probe
@@ -238,9 +239,9 @@ func (p *backchannelPipeline) startEncoder(ctx context.Context, bin, sdpFile str
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-protocol_whitelist", "file,rtp,udp",
-		// Increase read timeout: WebRTC mic audio may start with a delay
-		// while the user grants mic permission. Default timeout is too short.
-		"-rw_timeout", "10000000", // 10s in microseconds
+		// RTP socket read timeout: 30 seconds. WebRTC mic audio may start
+		// with a delay while the user grants mic permission.
+		"-timeout", "30000000", // 30s in microseconds
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 		"-latm", "1",
@@ -359,6 +360,9 @@ func (p *backchannelPipeline) readLOASAndSend() {
 				continue
 			}
 
+			// Successfully read a frame — reset crash counter
+			p.restartCount = 0
+
 			// Wrap in RFC 3640 format (single AU) and send via SRTP
 			payload := make([]byte, 4+len(aacFrame))
 			payload[0] = 0x00
@@ -384,7 +388,7 @@ func (p *backchannelPipeline) readLOASAndSend() {
 			}
 		}
 
-		// ffmpeg crashed or stdout EOF — attempt restart
+		// ffmpeg crashed or stdout EOF — attempt restart with backoff
 		p.mu.Lock()
 		closed = p.closed
 		p.mu.Unlock()
@@ -392,8 +396,18 @@ func (p *backchannelPipeline) readLOASAndSend() {
 			return
 		}
 
-		log.Printf("[backchannel] encoder crashed, restarting in 1s...")
-		time.Sleep(time.Second)
+		p.restartCount++
+		if p.restartCount > 10 {
+			log.Printf("[backchannel] encoder crashed %d times — giving up", p.restartCount)
+			return
+		}
+
+		backoff := time.Duration(p.restartCount) * time.Second
+		if backoff > 10*time.Second {
+			backoff = 10 * time.Second
+		}
+		log.Printf("[backchannel] encoder crashed, restarting in %v...", backoff)
+		time.Sleep(backoff)
 
 		// Recreate context for the new ffmpeg process
 		ctx, cancel := context.WithCancel(context.Background())

@@ -269,7 +269,7 @@ func (c *Client) startBackchannel() error {
 // startForwardAudio sets up the ELD→Opus transcoding pipeline and wires
 // the audio session handler. Must be called with audioMu held.
 func (c *Client) startForwardAudio() {
-	if c.audioTrack == nil {
+	if c.audioTrack == nil || c.audioSession == nil {
 		return
 	}
 	if c.forwardAudio != nil {
