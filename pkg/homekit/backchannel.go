@@ -239,9 +239,6 @@ func (p *backchannelPipeline) startEncoder(ctx context.Context, bin, sdpFile str
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-protocol_whitelist", "file,rtp,udp",
-		// RTP socket read timeout: 30 seconds. WebRTC mic audio may start
-		// with a delay while the user grants mic permission.
-		"-timeout", "30000000", // 30s in microseconds
 		"-f", "sdp", "-i", sdpFile,
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 		"-latm", "1",
