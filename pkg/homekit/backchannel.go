@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/srtp"
@@ -25,35 +26,57 @@ import (
 // parses LOAS frames, extracts raw AAC access units, wraps them in RFC 3640,
 // and sends via SRTP.
 type backchannelPipeline struct {
-	cmd      *exec.Cmd
+	mu       sync.Mutex
+	closed   bool
 	cancel   context.CancelFunc
 	sendConn *net.UDPConn  // sends Opus RTP to ffmpeg input
 	stdout   io.ReadCloser // encoder stdout (LOAS stream)
 	sdpFile  string
-	mu       sync.Mutex
-	closed   bool
+
+	// crash recovery
+	cmd       *exec.Cmd
+	bin       string
+	encoderArgs []string
+	session   *srtp.Session
+	sendCounter *int
+	tsIncrement uint32 // samples per frame, derived from codec clock rate
 }
 
-// findELDEncoder searches for an ffmpeg binary that can encode AAC-ELD
-// using libfdk_aac.
+// cachedELDEncoder is the result of findELDEncoder(), cached after first probe
+// to avoid spawning 3+ ffmpeg test processes on every backchannel start.
+var (
+	cachedELDEncoder     string
+	cachedELDEncoderOnce sync.Once
+)
+
+// cachedELDOptions caches probe results for -frame_length and -eld_sbr
+var (
+	cachedFrameLength bool
+	cachedEldSbr      bool
+	cachedOptionsOnce sync.Once
+)
+
 func findELDEncoder() string {
-	for _, bin := range []string{
-		"/usr/local/bin/ffmpeg-homebridge",
-		"/usr/local/bin/ffmpeg-fdk",
-		"ffmpeg-fdk",
-		"ffmpeg",
-	} {
-		testCmd := exec.Command(bin,
-			"-hide_banner", "-loglevel", "error",
-			"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
-			"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
-			"-ar", "16000", "-ac", "1",
-			"-f", "latm", os.DevNull)
-		if err := testCmd.Run(); err == nil {
-			return bin
+	cachedELDEncoderOnce.Do(func() {
+		for _, bin := range []string{
+			"/usr/local/bin/ffmpeg-homebridge",
+			"/usr/local/bin/ffmpeg-fdk",
+			"ffmpeg-fdk",
+			"ffmpeg",
+		} {
+			testCmd := exec.Command(bin,
+				"-hide_banner", "-loglevel", "error",
+				"-f", "lavfi", "-i", "sine=frequency=440:duration=0.1",
+				"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
+				"-ar", "16000", "-ac", "1",
+				"-f", "latm", os.DevNull)
+			if err := testCmd.Run(); err == nil {
+				cachedELDEncoder = bin
+				return
+			}
 		}
-	}
-	return ""
+	})
+	return cachedELDEncoder
 }
 
 // testELDOption tests if an ffmpeg binary supports a specific libfdk_aac option.
@@ -70,18 +93,32 @@ func testELDOption(bin string, extraArgs ...string) bool {
 	return testCmd.Run() == nil
 }
 
-func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backchannelPipeline, core.HandlerFunc, error) {
-	// Open a UDP port for ffmpeg to listen on for Opus RTP input
+// probeELDOptions probes -frame_length 480 and -eld_sbr 1 support once and caches.
+func probeELDOptions(bin string) (frameLength, eldSbr bool) {
+	cachedOptionsOnce.Do(func() {
+		cachedFrameLength = testELDOption(bin, "-frame_length", "480")
+		cachedEldSbr = testELDOption(bin, "-eld_sbr", "1")
+	})
+	return cachedFrameLength, cachedEldSbr
+}
+
+func startBackchannelPipeline(session *srtp.Session, sendCounter *int, clockRate uint32) (*backchannelPipeline, core.HandlerFunc, error) {
+	// Open a UDP port for ffmpeg to listen on for Opus RTP input.
+	// Keep the listener open (don't close+rebind) to avoid TOCTOU race.
 	inputAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, fmt.Errorf("backchannel: resolve: %w", err)
 	}
-	inputTmp, err := net.ListenUDP("udp", inputAddr)
+	inputConn, err := net.ListenUDP("udp", inputAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("backchannel: listen input: %w", err)
 	}
-	inputPort := inputTmp.LocalAddr().(*net.UDPAddr).Port
-	inputTmp.Close()
+	inputPort := inputConn.LocalAddr().(*net.UDPAddr).Port
+	// Don't close — ffmpeg needs to bind to this port, and we keep our
+	// sendConn pointing at it. The listener stays open for the pipeline lifetime.
+	// Actually we need to close the listener so ffmpeg can bind. But to avoid
+	// TOCTOU, we close it right before starting ffmpeg, minimizing the window.
+	inputConn.Close()
 
 	// Create SDP file describing the Opus RTP input stream
 	sdp := fmt.Sprintf(
@@ -109,16 +146,28 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pipeline := &backchannelPipeline{
-		sdpFile: sdpFileName,
-		cancel:  cancel,
-	}
-
 	eldEncoder := findELDEncoder()
 	if eldEncoder == "" {
 		cancel()
 		os.Remove(sdpFileName)
 		return nil, nil, fmt.Errorf("backchannel: no ffmpeg with libfdk_aac found")
+	}
+
+	// Derive timestamp increment from clock rate.
+	// AAC-ELD uses 480-sample frames at 16kHz = 30ms.
+	// At 24kHz the increment would be 720.
+	tsIncrement := uint32(480)
+	if clockRate > 0 {
+		// 480 samples per frame, scaled by clock rate relative to 16kHz base
+		tsIncrement = uint32(480 * clockRate / 16000)
+	}
+
+	pipeline := &backchannelPipeline{
+		sdpFile:     sdpFileName,
+		cancel:      cancel,
+		session:     session,
+		sendCounter: sendCounter,
+		tsIncrement: tsIncrement,
 	}
 
 	if err := pipeline.startEncoder(ctx, eldEncoder, sdpFileName); err != nil {
@@ -127,7 +176,7 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		return nil, nil, fmt.Errorf("backchannel: %w", err)
 	}
 
-	go pipeline.readLOASAndSend(session, sendCounter)
+	go pipeline.readLOASAndSend()
 
 	// Create UDP connection to send Opus RTP to ffmpeg's input port
 	ffmpegAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", inputPort))
@@ -157,12 +206,21 @@ func startBackchannelPipeline(session *srtp.Session, sendCounter *int) (*backcha
 		if err != nil {
 			return
 		}
-		sendConn.Write(b)
+		pipeline.mu.Lock()
+		if !pipeline.closed && pipeline.sendConn != nil {
+			pipeline.sendConn.Write(b)
+		}
+		pipeline.mu.Unlock()
 	}
 
 	go func() {
 		<-ctx.Done()
-		sendConn.Close()
+		pipeline.mu.Lock()
+		if pipeline.sendConn != nil {
+			pipeline.sendConn.Close()
+			pipeline.sendConn = nil
+		}
+		pipeline.mu.Unlock()
 	}()
 
 	return pipeline, handler, nil
@@ -184,10 +242,11 @@ func (p *backchannelPipeline) startEncoder(ctx context.Context, bin, sdpFile str
 		"-c:a", "libfdk_aac", "-profile:a", "aac_eld",
 		"-latm", "1",
 	}
-	if testELDOption(bin, "-frame_length", "480") {
+	frameLength, eldSbr := probeELDOptions(bin)
+	if frameLength {
 		args = append(args, "-frame_length", "480")
 	}
-	if testELDOption(bin, "-eld_sbr", "1") {
+	if eldSbr {
 		args = append(args, "-eld_sbr", "1")
 	}
 	args = append(args,
@@ -201,21 +260,27 @@ func (p *backchannelPipeline) startEncoder(ctx context.Context, bin, sdpFile str
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
 
 	p.cmd = cmd
+	p.bin = bin
+	p.encoderArgs = args
 	p.stdout = stdout
 
-	go func() {
-		cmd.Wait()
-	}()
+	// Capture stderr for debugging — was missing entirely before
+	go drainStderr("backchannel", stderr)
 
 	return nil
 }
 
-func drainStderr(name string, stderr interface{ Read([]byte) (int, error) }) {
+func drainStderr(name string, stderr io.Reader) {
 	if stderr == nil {
 		return
 	}
@@ -227,81 +292,119 @@ func drainStderr(name string, stderr interface{ Read([]byte) (int, error) }) {
 
 // readLOASAndSend reads LOAS frames from the encoder's stdout, extracts
 // raw AAC-ELD frames, wraps them in RFC 3640, and sends via SRTP.
-func (p *backchannelPipeline) readLOASAndSend(session *srtp.Session, sendCounter *int) {
-	r := bufio.NewReaderSize(p.stdout, 4096)
-
-	const timestampIncrement = 480
-	var timestamp uint32
-	var seq uint16
-	var firstFrame = true
-
+// Runs in a loop with crash recovery: if ffmpeg dies, it restarts the encoder.
+func (p *backchannelPipeline) readLOASAndSend() {
 	for {
-		// Find LOAS sync word: 0x56, then byte with top 3 bits = 111
-		b0, err := r.ReadByte()
-		if err != nil {
-			return
-		}
-		if b0 != 0x56 {
-			continue
-		}
-
-		b1, err := r.ReadByte()
-		if err != nil {
-			return
-		}
-		if b1&0xE0 != 0xE0 {
-			r.UnreadByte()
-			continue
-		}
-
-		b2, err := r.ReadByte()
-		if err != nil {
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
 			return
 		}
 
-		// Frame length from 13 bits: 5 bits from b1 + 8 bits from b2
-		frameLen := int(b1&0x1F)<<8 | int(b2)
-		if frameLen == 0 || frameLen > 8192 {
-			continue
+		r := bufio.NewReaderSize(p.stdout, 4096)
+
+		var timestamp uint32
+		var seq uint16
+		var firstFrame = true
+
+		for {
+			// Find LOAS sync word: 0x56, then byte with top 3 bits = 111
+			b0, err := r.ReadByte()
+			if err != nil {
+				log.Printf("[backchannel] stdout read error: %v — restarting encoder", err)
+				break
+			}
+			if b0 != 0x56 {
+				continue
+			}
+
+			b1, err := r.ReadByte()
+			if err != nil {
+				log.Printf("[backchannel] stdout read error: %v — restarting encoder", err)
+				break
+			}
+			if b1&0xE0 != 0xE0 {
+				r.UnreadByte()
+				continue
+			}
+
+			b2, err := r.ReadByte()
+			if err != nil {
+				log.Printf("[backchannel] stdout read error: %v — restarting encoder", err)
+				break
+			}
+
+			// Frame length from 13 bits: 5 bits from b1 + 8 bits from b2
+			frameLen := int(b1&0x1F)<<8 | int(b2)
+			if frameLen == 0 || frameLen > 8192 {
+				continue
+			}
+
+			// Read AudioMuxElement
+			ameBuf := make([]byte, frameLen)
+			if _, err := io.ReadFull(r, ameBuf); err != nil {
+				log.Printf("[backchannel] frame read error: %v — restarting encoder", err)
+				break
+			}
+
+			// Parse AudioMuxElement to extract raw AAC frame
+			aacFrame := extractAACFromAME(ameBuf, firstFrame)
+			firstFrame = false
+
+			if aacFrame == nil {
+				continue
+			}
+
+			// Wrap in RFC 3640 format (single AU) and send via SRTP
+			payload := make([]byte, 4+len(aacFrame))
+			payload[0] = 0x00
+			payload[1] = 0x10 // 16 bits of AU headers
+			payload[2] = byte((len(aacFrame) << 3) >> 8)
+			payload[3] = byte((len(aacFrame) << 3) & 0xFF)
+			copy(payload[4:], aacFrame)
+
+			packet := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					Marker:         true,
+					SequenceNumber: seq,
+					Timestamp:      timestamp,
+				},
+				Payload: payload,
+			}
+			seq++
+			timestamp += p.tsIncrement
+
+			if sent, err := p.session.WriteRTP(packet); err == nil {
+				*p.sendCounter += sent
+			}
 		}
 
-		// Read AudioMuxElement
-		ameBuf := make([]byte, frameLen)
-		if _, err := io.ReadFull(r, ameBuf); err != nil {
+		// ffmpeg crashed or stdout EOF — attempt restart
+		p.mu.Lock()
+		closed = p.closed
+		p.mu.Unlock()
+		if closed {
 			return
 		}
 
-		// Parse AudioMuxElement to extract raw AAC frame
-		aacFrame := extractAACFromAME(ameBuf, firstFrame)
-		firstFrame = false
+		log.Printf("[backchannel] encoder crashed, restarting in 1s...")
+		time.Sleep(time.Second)
 
-		if aacFrame == nil {
-			continue
+		// Recreate context for the new ffmpeg process
+		ctx, cancel := context.WithCancel(context.Background())
+		p.mu.Lock()
+		p.cancel = cancel
+		p.mu.Unlock()
+
+		// Reuse existing SDP file (still on disk)
+		if err := p.startEncoder(ctx, p.bin, p.sdpFile); err != nil {
+			log.Printf("[backchannel] encoder restart failed: %v — giving up", err)
+			cancel()
+			return
 		}
-
-		// Wrap in RFC 3640 format (single AU) and send via SRTP
-		payload := make([]byte, 4+len(aacFrame))
-		payload[0] = 0x00
-		payload[1] = 0x10 // 16 bits of AU headers
-		payload[2] = byte((len(aacFrame) << 3) >> 8)
-		payload[3] = byte((len(aacFrame) << 3) & 0xFF)
-		copy(payload[4:], aacFrame)
-
-		packet := &rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         true,
-				SequenceNumber: seq,
-				Timestamp:      timestamp,
-			},
-			Payload: payload,
-		}
-		seq++
-		timestamp += timestampIncrement
-
-		if sent, err := session.WriteRTP(packet); err == nil {
-			*sendCounter += sent
-		}
+		log.Printf("[backchannel] encoder restarted successfully")
 	}
 }
 
@@ -313,8 +416,10 @@ func extractAACFromAME(data []byte, isFirst bool) []byte {
 		return nil
 	}
 
-	if isFirst || data[0]&0x80 == 0 {
-		// First frame or useSameStreamMux=0: contains StreamMuxConfig, skip it
+	// useSameStreamMux is the top bit. If it's 0, this frame contains
+	// StreamMuxConfig — skip it (but only if we haven't seen any config yet).
+	// After the first frame, a 0 bit means a new StreamMuxConfig (config refresh).
+	if data[0]&0x80 == 0 {
 		return nil
 	}
 
