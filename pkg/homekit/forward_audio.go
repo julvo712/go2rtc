@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -17,19 +18,30 @@ import (
 // forwardAudioPipeline transcodes incoming ELD RTP (from camera SRTP) to Opus
 // RTP (for WebRTC consumers) via ffmpeg.
 type forwardAudioPipeline struct {
-	cmd      *exec.Cmd
+	mu       sync.Mutex
+	closed   bool
 	cancel   context.CancelFunc
 	eldConn  *net.UDPConn   // sends ELD RTP to ffmpeg input
 	opusConn net.PacketConn // receives Opus RTP from ffmpeg output
 	sdpFile  string
-	mu       sync.Mutex
-	closed   bool
+
+	// crash recovery
+	cmd        *exec.Cmd
+	bin        string
+	eldPort    int
+	opusPort   int
+	audioTrack *core.Receiver
+	recvCounter *int
+	configHex  string
 }
 
 // startForwardAudioPipeline sets up an ffmpeg process that decodes AAC-ELD RTP
 // and re-encodes as Opus RTP. Returns the pipeline (caller feeds ELD packets
 // via WriteELDPacket) and the output is written directly to audioTrack.
-func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*forwardAudioPipeline, error) {
+//
+// configHex is the AudioSpecificConfig hex for the camera's AAC-ELD stream.
+// If empty, a default for 16kHz mono ELD with LD-SBR is used.
+func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int, configHex string) (*forwardAudioPipeline, error) {
 	// Find free ports for ffmpeg input (ELD) and output (Opus)
 	eldListener, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -44,8 +56,10 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	}
 	opusPort := opusListener.LocalAddr().(*net.UDPAddr).Port
 
-	// AudioSpecificConfig for AAC-ELD 16kHz mono with LD-SBR, 480-sample frames.
-	configHex := "F8F0312C00BC00"
+	// Use provided ASC, or fall back to default for 16kHz mono ELD with LD-SBR
+	if configHex == "" {
+		configHex = "F8F0312C00BC00"
+	}
 
 	sdp := fmt.Sprintf(
 		"v=0\r\n"+
@@ -79,32 +93,21 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 		ffmpegBin = "ffmpeg"
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	cmd := exec.CommandContext(ctx, ffmpegBin,
-		"-hide_banner", "-loglevel", "error",
-		"-c:a", "libfdk_aac",
-		"-protocol_whitelist", "file,rtp,udp",
-		"-f", "sdp", "-i", sdpFileName,
-		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
-		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", opusPort))
-
-	stderr, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		opusListener.Close()
-		os.Remove(sdpFileName)
-		return nil, fmt.Errorf("forward: start ffmpeg: %w", err)
+	pipeline := &forwardAudioPipeline{
+		sdpFile:     sdpFileName,
+		opusConn:    opusListener,
+		eldPort:     eldPort,
+		opusPort:    opusPort,
+		audioTrack:  audioTrack,
+		recvCounter: recvCounter,
+		bin:         ffmpegBin,
+		configHex:   configHex,
 	}
 
-	go drainStderr("forward-audio", stderr)
-
-	pipeline := &forwardAudioPipeline{
-		cmd:      cmd,
-		cancel:   cancel,
-		opusConn: opusListener,
-		sdpFile:  sdpFileName,
+	if err := pipeline.startFFmpeg(); err != nil {
+		opusListener.Close()
+		os.Remove(sdpFileName)
+		return nil, fmt.Errorf("forward: %w", err)
 	}
 
 	// Create UDP connection to send ELD RTP to ffmpeg's input port
@@ -117,14 +120,72 @@ func startForwardAudioPipeline(audioTrack *core.Receiver, recvCounter *int) (*fo
 	pipeline.eldConn = eldSendConn
 
 	// Read Opus RTP output from ffmpeg and write to audio track
-	go pipeline.readOpusAndForward(audioTrack, recvCounter)
-
-	go func() {
-		cmd.Wait()
-		log.Printf("[forward-audio] ffmpeg exited")
-	}()
+	go pipeline.readOpusAndForward()
 
 	return pipeline, nil
+}
+
+// startFFmpeg launches the ffmpeg process for ELD→Opus transcoding.
+func (p *forwardAudioPipeline) startFFmpeg() error {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cmd := exec.CommandContext(ctx, p.bin,
+		"-hide_banner", "-loglevel", "error",
+		"-c:a", "libfdk_aac",
+		"-protocol_whitelist", "file,rtp,udp",
+		"-f", "sdp", "-i", p.sdpFile,
+		"-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "64k",
+		"-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", p.opusPort))
+
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return fmt.Errorf("start ffmpeg: %w", err)
+	}
+
+	p.mu.Lock()
+	p.cmd = cmd
+	p.cancel = cancel
+	p.mu.Unlock()
+
+	go drainStderr("forward-audio", stderr)
+
+	go func() {
+		err := cmd.Wait()
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if !closed && err != nil {
+			log.Printf("[forward-audio] ffmpeg exited: %v — restarting", err)
+			p.restart()
+		}
+	}()
+
+	return nil
+}
+
+// restart relaunches the ffmpeg process after a crash.
+func (p *forwardAudioPipeline) restart() {
+	for i := 0; i < 3; i++ {
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			return
+		}
+
+		time.Sleep(time.Second)
+		log.Printf("[forward-audio] restart attempt %d/%d", i+1, 3)
+
+		if err := p.startFFmpeg(); err != nil {
+			log.Printf("[forward-audio] restart failed: %v", err)
+			continue
+		}
+		log.Printf("[forward-audio] ffmpeg restarted successfully")
+		return
+	}
+	log.Printf("[forward-audio] giving up after 3 restart attempts")
 }
 
 // WriteELDPacket forwards a decrypted ELD RTP packet from the camera to ffmpeg.
@@ -133,11 +194,17 @@ func (p *forwardAudioPipeline) WriteELDPacket(packet *rtp.Packet) {
 	if err != nil {
 		return
 	}
-	p.eldConn.Write(b)
+	p.mu.Lock()
+	if !p.closed && p.eldConn != nil {
+		p.eldConn.Write(b)
+	}
+	p.mu.Unlock()
 }
 
 // readOpusAndForward reads Opus RTP packets from ffmpeg output and writes to track.
-func (p *forwardAudioPipeline) readOpusAndForward(track *core.Receiver, recvCounter *int) {
+// Runs in a loop with crash recovery: if the opusConn read fails, it waits
+// for ffmpeg to restart (handled by the cmd.Wait goroutine in startFFmpeg).
+func (p *forwardAudioPipeline) readOpusAndForward() {
 	buf := make([]byte, 2048)
 
 	for {
@@ -157,8 +224,8 @@ func (p *forwardAudioPipeline) readOpusAndForward(track *core.Receiver, recvCoun
 			continue
 		}
 
-		track.WriteRTP(packet)
-		*recvCounter += len(packet.Payload)
+		p.audioTrack.WriteRTP(packet)
+		*p.recvCounter += len(packet.Payload)
 	}
 }
 

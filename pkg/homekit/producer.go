@@ -1,13 +1,16 @@
 package homekit
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
+	"github.com/AlexxIT/go2rtc/pkg/aac"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/hap"
 	"github.com/AlexxIT/go2rtc/pkg/hap/camera"
@@ -30,6 +33,7 @@ type Client struct {
 
 	stream *camera.Stream
 
+	backchannelMu    sync.Mutex           // protects backchannel start against concurrent AddTrack+Start
 	backchannel      *backchannelPipeline // ffmpeg Opus→AAC-ELD transcoder
 	backchannelCodec *core.Codec          // codec of the backchannel track (for deferred start)
 	backchannelTrack *core.Receiver       // backchannel track (for deferred start)
@@ -145,6 +149,9 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 		return errors.New("homekit: AddTrack only for sendonly (backchannel)")
 	}
 
+	c.backchannelMu.Lock()
+	defer c.backchannelMu.Unlock()
+
 	c.backchannelCodec = codec
 	c.backchannelTrack = track
 
@@ -202,7 +209,7 @@ func (c *Client) unmuteSpeaker() {
 }
 
 // startBackchannel wires up the backchannel audio pipeline after the SRTP
-// session has been established. Must be called from Start().
+// session has been established. Must be called with backchannelMu held.
 func (c *Client) startBackchannel() error {
 	c.unmuteSpeaker()
 
@@ -229,7 +236,17 @@ func (c *Client) startBackchannel() error {
 		}
 	} else {
 		// Transcoding path: spawn ffmpeg Opus→AAC-ELD pipeline
-		pipeline, handler, err := startBackchannelPipeline(c.audioSession, &c.Send)
+		// Pass the negotiated audio clock rate so timestamps are correct
+		clockRate := uint32(16000) // default for AAC-ELD
+		if c.audioConfig.Codecs != nil && len(c.audioConfig.Codecs) > 0 {
+			if len(c.audioConfig.Codecs[0].CodecParams) > 0 && len(c.audioConfig.Codecs[0].CodecParams[0].SampleRate) > 0 {
+				srIdx := int(c.audioConfig.Codecs[0].CodecParams[0].SampleRate[0])
+				if srIdx < len(audioSampleRates) {
+					clockRate = audioSampleRates[srIdx]
+				}
+			}
+		}
+		pipeline, handler, err := startBackchannelPipeline(c.audioSession, &c.Send, clockRate)
 		if err != nil {
 			return fmt.Errorf("homekit: backchannel pipeline: %w", err)
 		}
@@ -279,12 +296,14 @@ func (c *Client) Start() error {
 	c.audioSession.RTCPInterval = toDuration(audioCodec.RTPParams[0].RTCPInterval)
 
 	// Start backchannel pipeline if a backchannel track was registered via AddTrack
+	c.backchannelMu.Lock()
 	if c.backchannelTrack != nil {
 		if err := c.startBackchannel(); err != nil {
 			// Backchannel failure is non-fatal — video/audio reception still works
 			_ = err
 		}
 	}
+	c.backchannelMu.Unlock()
 
 	deadline := time.NewTimer(core.ConnDeadline)
 
@@ -303,7 +322,17 @@ func (c *Client) Start() error {
 		needsTranscoding := audioTrack.Codec.Name == core.CodecOpus
 
 		if needsTranscoding {
-			fwd, err := startForwardAudioPipeline(audioTrack, &c.Recv)
+			// Build ASC from camera's audio config for the ffmpeg decoder
+			configHex := ""
+			if len(c.audioConfig.Codecs) > 0 && len(c.audioConfig.Codecs[0].CodecParams) > 0 && len(c.audioConfig.Codecs[0].CodecParams[0].SampleRate) > 0 {
+				param := c.audioConfig.Codecs[0].CodecParams[0]
+				srIdx := int(param.SampleRate[0])
+				if srIdx < len(audioSampleRates) {
+					asc := aac.EncodeConfig(aac.TypeAACELD, audioSampleRates[srIdx], param.Channels, true)
+					configHex = hex.EncodeToString(asc)
+				}
+			}
+			fwd, err := startForwardAudioPipeline(audioTrack, &c.Recv, configHex)
 			if err != nil {
 				log.Printf("[homekit] forward audio failed: %v", err)
 			} else {
