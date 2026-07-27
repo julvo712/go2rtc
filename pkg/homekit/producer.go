@@ -40,6 +40,13 @@ type Client struct {
 
 	forwardAudio *forwardAudioPipeline // ffmpeg ELD→Opus transcoder (camera mic → browser)
 
+	// audioMu protects lazy audio handler setup. Start() may run before any
+	// audio consumer connects (e.g. Frigate video-only). When a WebRTC consumer
+	// connects later, the audio track is set and the forward pipeline started.
+	audioMu      sync.Mutex
+	audioTrack   *core.Receiver
+	audioHandler core.HandlerFunc // current passthrough handler (for ELD consumers)
+
 	MaxWidth  int `json:"-"`
 	MaxHeight int `json:"-"`
 	Bitrate   int `json:"-"` // in bits/s
@@ -259,6 +266,80 @@ func (c *Client) startBackchannel() error {
 	return nil
 }
 
+// startForwardAudio sets up the ELD→Opus transcoding pipeline and wires
+// the audio session handler. Must be called with audioMu held.
+func (c *Client) startForwardAudio() {
+	if c.audioTrack == nil {
+		return
+	}
+	if c.forwardAudio != nil {
+		return // already started
+	}
+
+	// Build ASC from camera's audio config for the ffmpeg decoder
+	configHex := ""
+	if len(c.audioConfig.Codecs) > 0 && len(c.audioConfig.Codecs[0].CodecParams) > 0 && len(c.audioConfig.Codecs[0].CodecParams[0].SampleRate) > 0 {
+		param := c.audioConfig.Codecs[0].CodecParams[0]
+		srIdx := int(param.SampleRate[0])
+		if srIdx < len(audioSampleRates) {
+			asc := aac.EncodeConfig(aac.TypeAACELD, audioSampleRates[srIdx], param.Channels, true)
+			configHex = hex.EncodeToString(asc)
+		}
+	}
+
+	fwd, err := startForwardAudioPipeline(c.audioTrack, &c.Recv, configHex)
+	if err != nil {
+		log.Printf("[homekit] forward audio failed: %v", err)
+		return
+	}
+	c.forwardAudio = fwd
+	c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
+		fwd.WriteELDPacket(packet)
+		c.Recv += len(packet.Payload)
+	}
+	log.Printf("[homekit] forward audio pipeline started (ELD→Opus)")
+}
+
+// SetAudioTrack is called when a new consumer wants audio. If the forward
+// audio pipeline isn't running yet (because Start() ran with no audio
+// consumer), this starts it. For ELD passthrough consumers, it sets the
+// handler to write directly to the track.
+func (c *Client) SetAudioTrack(track *core.Receiver) {
+	c.audioMu.Lock()
+	defer c.audioMu.Unlock()
+
+	c.audioTrack = track
+
+	if track.Codec.Name == core.CodecOpus {
+		// Consumer wants Opus — start ELD→Opus transcoding if not already running
+		c.startForwardAudio()
+	} else {
+		// Consumer natively supports ELD — set passthrough handler
+		c.audioHandler = func(packet *rtp.Packet) {
+			track.WriteRTP(packet)
+			c.Recv += len(packet.Payload)
+		}
+		c.audioSession.OnReadRTP = timekeeper(c.audioHandler)
+		log.Printf("[homekit] audio passthrough started (ELD direct)")
+	}
+}
+
+// GetTrack overrides core.Connection.GetTrack to lazily start the forward
+// audio pipeline when a consumer requests an audio track. This handles the
+// case where Start() ran with a video-only consumer (e.g. Frigate) and the
+// audio handler was never set. When a WebRTC consumer later requests audio,
+// this triggers the ELD→Opus transcoding pipeline.
+func (c *Client) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
+	track, err := c.Connection.GetTrack(media, codec)
+	if err != nil {
+		return nil, err
+	}
+	if media.Kind == core.KindAudio && media.Direction == core.DirectionRecvonly {
+		c.SetAudioTrack(track)
+	}
+	return track, nil
+}
+
 func (c *Client) Start() error {
 	if c.Receivers == nil {
 		return errors.New("producer without tracks")
@@ -316,47 +397,41 @@ func (c *Client) Start() error {
 		}
 	}
 
-	// Set up audio handler (with ELD→Opus transcoding if needed)
+	// Set up audio handler — always install a handler even if no audio consumer
+	// is connected yet. The handler routes to a dynamically upgradeable target
+	// so that when a WebRTC consumer connects later wanting audio, we can
+	// start the ELD→Opus transcoding pipeline without re-running Start().
+	c.audioMu.Lock()
 	if audioTrack != nil {
-		needsDeadline := videoTrack == nil
+		c.audioTrack = audioTrack
 		needsTranscoding := audioTrack.Codec.Name == core.CodecOpus
 
 		if needsTranscoding {
-			// Build ASC from camera's audio config for the ffmpeg decoder
-			configHex := ""
-			if len(c.audioConfig.Codecs) > 0 && len(c.audioConfig.Codecs[0].CodecParams) > 0 && len(c.audioConfig.Codecs[0].CodecParams[0].SampleRate) > 0 {
-				param := c.audioConfig.Codecs[0].CodecParams[0]
-				srIdx := int(param.SampleRate[0])
-				if srIdx < len(audioSampleRates) {
-					asc := aac.EncodeConfig(aac.TypeAACELD, audioSampleRates[srIdx], param.Channels, true)
-					configHex = hex.EncodeToString(asc)
-				}
-			}
-			fwd, err := startForwardAudioPipeline(audioTrack, &c.Recv, configHex)
-			if err != nil {
-				log.Printf("[homekit] forward audio failed: %v", err)
-			} else {
-				c.forwardAudio = fwd
-				c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
-					if needsDeadline {
-						deadline.Reset(core.ConnDeadline)
-					}
-					fwd.WriteELDPacket(packet)
-					c.Recv += len(packet.Payload)
-				}
-			}
+			c.startForwardAudio()
 		} else {
 			// Direct ELD passthrough (consumer natively supports ELD)
-			handler := func(packet *rtp.Packet) {
-				if needsDeadline {
+			c.audioHandler = func(packet *rtp.Packet) {
+				if videoTrack == nil {
 					deadline.Reset(core.ConnDeadline)
 				}
 				audioTrack.WriteRTP(packet)
 				c.Recv += len(packet.Payload)
 			}
-			c.audioSession.OnReadRTP = timekeeper(handler)
+			c.audioSession.OnReadRTP = timekeeper(c.audioHandler)
+		}
+	} else {
+		// No audio consumer yet — install a no-op handler that keeps the
+		// deadline alive if video is also absent, and can be upgraded later
+		// via startForwardAudio() or setAudioHandler().
+		c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
+			// Camera is sending audio but no consumer wants it yet.
+			// Drop silently — the bytes are counted for deadline keepalive.
+			if videoTrack == nil {
+				deadline.Reset(core.ConnDeadline)
+			}
 		}
 	}
+	c.audioMu.Unlock()
 
 	<-deadline.C
 
